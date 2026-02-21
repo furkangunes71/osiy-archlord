@@ -1,3 +1,4 @@
+#include <float.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <time.h>
@@ -14,6 +15,7 @@
 #include "core/core.h"
 #include "core/file_system.h"
 #include "core/log.h"
+#include "core/malloc.h"
 #include "core/os.h"
 
 #include "task/task.h"
@@ -49,6 +51,7 @@
 #include "public/ap_item_convert.h"
 #include "public/ap_login.h"
 #include "public/ap_map.h"
+#include "public/ap_sector.h"
 #include "public/ap_object.h"
 #include "public/ap_octree.h"
 #include "public/ap_optimized_packet2.h"
@@ -106,6 +109,10 @@
 struct camera_controls {
 	boolean key_state[512];
 };
+
+static boolean g_RegionLock = FALSE;
+static float g_RegionMin[2] = { 0 };
+static float g_RegionMax[2] = { 0 };
 
 typedef ap_module_t (*create_module_t)();
 
@@ -787,37 +794,268 @@ static void update_camera(
 	float speed =
 		key_state[SDL_SCANCODE_LSHIFT] ? 1000.0f : 10000.0f;
 	uint32_t mb_state = SDL_GetMouseState(NULL, NULL);
-	/*
 	if (key_state[SDL_SCANCODE_W])
-		ar_cam_translate(cam, dt * speed, 0.f, 0.f);
+		ac_camera_translate(cam, dt * speed, 0.f, 0.f);
 	else if (key_state[SDL_SCANCODE_S])
-		ar_cam_translate(cam, -dt * speed, 0.f, 0.f);
+		ac_camera_translate(cam, -dt * speed, 0.f, 0.f);
 	if (key_state[SDL_SCANCODE_D])
-		ar_cam_translate(cam, 0.f, dt * speed, 0.f);
+		ac_camera_translate(cam, 0.f, dt * speed, 0.f);
 	else if (key_state[SDL_SCANCODE_A])
-		ar_cam_translate(cam, 0.f, -dt * speed, 0.f);
-	if (key_state[SDL_SCANCODE_UP])
-		ar_cam_translate(cam, 0.f, 0.f, dt * speed);
-	else if (key_state[SDL_SCANCODE_DOWN])
-		ar_cam_translate(cam, 0.f, 0.f, -dt * speed);
-	*/
+		ac_camera_translate(cam, 0.f, -dt * speed, 0.f);
+	if (key_state[SDL_SCANCODE_E])
+		ac_camera_translate(cam, 0.f, 0.f, dt * speed);
+	else if (key_state[SDL_SCANCODE_Q])
+		ac_camera_translate(cam, 0.f, 0.f, -dt * speed);
 	if ((mb_state & SDL_BUTTON(SDL_BUTTON_LEFT)) &&
 		(mb_state & SDL_BUTTON(SDL_BUTTON_RIGHT))) {
 		ac_camera_translate(cam, 
 			speed * dt, 0.0f, 0.0f);
 	}
+	if (g_RegionLock) {
+		cam->center_dst[0] = glm_clamp(cam->center_dst[0],
+			g_RegionMin[0], g_RegionMax[0]);
+		cam->center_dst[2] = glm_clamp(cam->center_dst[2],
+			g_RegionMin[1], g_RegionMax[1]);
+	}
 	ac_camera_update(cam, dt);
+}
+
+struct region_scan_result {
+	float centroid[2];
+	uint32_t grid_min_x;
+	uint32_t grid_min_z;
+	uint32_t grid_width;
+	uint32_t grid_height;
+	boolean * grid;
+};
+
+/*
+ * Scan node_data to build a per-sector boolean grid
+ * for a target region. Uses the same per-segment region_id
+ * lookup as the game server (as_map_get_region_at).
+ *
+ *   Pass 1: Find all sectors with ANY matching segment,
+ *           compute centroid, determine sector index bounds.
+ *   Pass 2: Filter out distant outlier sectors (>3 div
+ *           from centroid) and build the boolean grid.
+ */
+static boolean find_region_sectors(
+	uint32_t target_region_id,
+	struct region_scan_result * result)
+{
+	const char * node_path = ap_config_get(g_ApConfig, "ServerNodePath");
+	size_t size = 0;
+	void * data;
+	uint32_t * cursor;
+	double sum_x = 0.0;
+	double sum_z = 0.0;
+	uint32_t match_count = 0;
+	float cx, cz;
+	uint32_t cx_sx, cx_sz;
+	float p_centroid[3];
+	const float max_radius = AP_SECTOR_WIDTH * AP_SECTOR_DEFAULT_DEPTH * 3.0f;
+	uint32_t smin_x = UINT32_MAX, smin_z = UINT32_MAX;
+	uint32_t smax_x = 0, smax_z = 0;
+	uint32_t gw, gh;
+	boolean * grid;
+	uint32_t grid_count = 0;
+	if (!node_path) {
+		ERROR("find_region_sectors: ServerNodePath not set in config.");
+		return FALSE;
+	}
+	if (!get_file_size(node_path, &size) || !size) {
+		ERROR("find_region_sectors: Failed to get file size (%s).",
+			node_path);
+		return FALSE;
+	}
+	data = alloc(size);
+	if (!load_file(node_path, data, size)) {
+		ERROR("find_region_sectors: Failed to load (%s).", node_path);
+		dealloc(data);
+		return FALSE;
+	}
+	/* Pass 1: compute centroid from all matching segments. */
+	cursor = (uint32_t *)data;
+	{
+		size_t remaining = size;
+		while (remaining >= 1032) {
+			uint32_t x = *cursor++;
+			uint32_t z = *cursor++;
+			uint32_t si;
+			for (si = 0; si < 256; si++) {
+				uint16_t region_id;
+				memcpy(&region_id, (uint8_t *)cursor + 2, 2);
+				if ((region_id & 0x00FF) == target_region_id) {
+					uint32_t sx = si % 16;
+					uint32_t sz = si / 16;
+					sum_x += AP_SECTOR_WORLD_START_X +
+						x * AP_SECTOR_WIDTH +
+						sx * AP_SECTOR_STEPSIZE +
+						AP_SECTOR_STEPSIZE * 0.5f;
+					sum_z += AP_SECTOR_WORLD_START_Z +
+						z * AP_SECTOR_HEIGHT +
+						sz * AP_SECTOR_STEPSIZE +
+						AP_SECTOR_STEPSIZE * 0.5f;
+					match_count++;
+				}
+				cursor++;
+			}
+			remaining -= 1032;
+		}
+	}
+	if (match_count == 0) {
+		INFO("find_region_sectors: no segments for region_id=%u",
+			target_region_id);
+		dealloc(data);
+		return FALSE;
+	}
+	cx = (float)(sum_x / match_count);
+	cz = (float)(sum_z / match_count);
+	p_centroid[0] = cx;
+	p_centroid[1] = 0.0f;
+	p_centroid[2] = cz;
+	if (!ap_scr_pos_to_index(p_centroid, &cx_sx, &cx_sz)) {
+		dealloc(data);
+		return FALSE;
+	}
+	INFO("find_region_sectors: centroid=[%.0f,%.0f] sector=[%u,%u] "
+		"(%u segments)", cx, cz, cx_sx, cx_sz, match_count);
+	/* Pass 2: find sectors near centroid that have ANY
+	 * matching segment, compute grid bounds. */
+	cursor = (uint32_t *)data;
+	{
+		size_t remaining = size;
+		while (remaining >= 1032) {
+			uint32_t x = *cursor++;
+			uint32_t z = *cursor++;
+			uint32_t si;
+			boolean has_match = FALSE;
+			float dx, dz;
+			for (si = 0; si < 256; si++) {
+				uint16_t region_id;
+				memcpy(&region_id, (uint8_t *)cursor + 2, 2);
+				if ((region_id & 0x00FF) == target_region_id)
+					has_match = TRUE;
+				cursor++;
+			}
+			dx = (AP_SECTOR_WORLD_START_X +
+				x * AP_SECTOR_WIDTH + AP_SECTOR_WIDTH * 0.5f) - cx;
+			dz = (AP_SECTOR_WORLD_START_Z +
+				z * AP_SECTOR_HEIGHT + AP_SECTOR_HEIGHT * 0.5f) - cz;
+			if (has_match &&
+				dx * dx + dz * dz <= max_radius * max_radius) {
+				if (x < smin_x) smin_x = x;
+				if (z < smin_z) smin_z = z;
+				if (x > smax_x) smax_x = x;
+				if (z > smax_z) smax_z = z;
+			}
+			remaining -= 1032;
+		}
+	}
+	if (smin_x > smax_x) {
+		dealloc(data);
+		return FALSE;
+	}
+	gw = smax_x - smin_x + 1;
+	gh = smax_z - smin_z + 1;
+	grid = (boolean *)alloc(gw * gh * sizeof(boolean));
+	memset(grid, 0, gw * gh * sizeof(boolean));
+	/* Pass 3: fill grid. */
+	cursor = (uint32_t *)data;
+	{
+		size_t remaining = size;
+		while (remaining >= 1032) {
+			uint32_t x = *cursor++;
+			uint32_t z = *cursor++;
+			uint32_t si;
+			boolean has_match = FALSE;
+			float dx, dz;
+			for (si = 0; si < 256; si++) {
+				uint16_t region_id;
+				memcpy(&region_id, (uint8_t *)cursor + 2, 2);
+				if ((region_id & 0x00FF) == target_region_id)
+					has_match = TRUE;
+				cursor++;
+			}
+			dx = (AP_SECTOR_WORLD_START_X +
+				x * AP_SECTOR_WIDTH + AP_SECTOR_WIDTH * 0.5f) - cx;
+			dz = (AP_SECTOR_WORLD_START_Z +
+				z * AP_SECTOR_HEIGHT + AP_SECTOR_HEIGHT * 0.5f) - cz;
+			if (has_match &&
+				dx * dx + dz * dz <= max_radius * max_radius) {
+				uint32_t gx = x - smin_x;
+				uint32_t gz = z - smin_z;
+				grid[gz * gw + gx] = TRUE;
+				grid_count++;
+			}
+			remaining -= 1032;
+		}
+	}
+	dealloc(data);
+	result->centroid[0] = cx;
+	result->centroid[1] = cz;
+	result->grid_min_x = smin_x;
+	result->grid_min_z = smin_z;
+	result->grid_width = gw;
+	result->grid_height = gh;
+	result->grid = grid;
+	INFO("find_region_sectors: grid [%u,%u] size %ux%u, "
+		"%u sectors marked",
+		smin_x, smin_z, gw, gh, grid_count);
+	return TRUE;
 }
 
 static void setspawnpos(struct ac_camera * cam)
 {
-	vec3 center = { -462922.5f,3217.9f,-44894.8f };
-	const char * config = ap_config_get(g_ApConfig, "EditorStartPosition");
-	if (config) {
+	vec3 center = { -462922.5f, 3217.9f, -44894.8f };
+	const char * region_cfg = ap_config_get(g_ApConfig, "EditorStartRegion");
+	INFO("setspawnpos: EditorStartRegion=%s", region_cfg ? region_cfg : "(null)");
+	if (region_cfg) {
+		uint32_t region_id = (uint32_t)strtoul(region_cfg, NULL, 10);
+		struct region_scan_result scan = { 0 };
+		INFO("setspawnpos: parsed region_id=%u", region_id);
+		if (find_region_sectors(region_id, &scan)) {
+			float vd;
+			g_RegionLock = TRUE;
+			center[0] = scan.centroid[0];
+			center[2] = scan.centroid[1];
+			/* World-coord bounds for camera clamping. */
+			g_RegionMin[0] = ap_scr_get_start_x(scan.grid_min_x);
+			g_RegionMin[1] = ap_scr_get_start_z(scan.grid_min_z);
+			g_RegionMax[0] = ap_scr_get_end_x(
+				scan.grid_min_x + scan.grid_width - 1);
+			g_RegionMax[1] = ap_scr_get_end_z(
+				scan.grid_min_z + scan.grid_height - 1);
+			/* Pass exact sector grid to terrain and object modules. */
+			ac_terrain_set_sector_grid(g_AcTerrain,
+				scan.grid_min_x, scan.grid_min_z,
+				scan.grid_width, scan.grid_height, scan.grid);
+			ac_object_set_sector_grid(g_AcObject,
+				scan.grid_min_x, scan.grid_min_z,
+				scan.grid_width, scan.grid_height, scan.grid);
+			/* View distance covers the full grid. */
+			vd = ((scan.grid_width > scan.grid_height ?
+				scan.grid_width : scan.grid_height) *
+				AP_SECTOR_WIDTH) * 0.5f + AP_SECTOR_WIDTH;
+			ac_terrain_set_view_distance(g_AcTerrain, vd);
+			INFO("EditorStartRegion=%u: grid [%u,%u] %ux%u "
+				"view_distance=%.0f",
+				region_id, scan.grid_min_x, scan.grid_min_z,
+				scan.grid_width, scan.grid_height, vd);
+			dealloc(scan.grid);
+		} else {
+			WARN("EditorStartRegion=%u: region not found in node_data.",
+				region_id);
+		}
+	}
+	const char * pos_cfg = ap_config_get(g_ApConfig, "EditorStartPosition");
+	if (pos_cfg) {
 		vec3 c = { 0 };
-		if (sscanf(config, "%f,%f,%f", &c[0], &c[1], &c[2]))
+		if (sscanf(pos_cfg, "%f,%f,%f", &c[0], &c[1], &c[2]))
 			glm_vec3_copy(c, center);
 	}
+	INFO("setspawnpos: final center=[%.1f,%.1f,%.1f] region_lock=%d",
+		center[0], center[1], center[2], g_RegionLock);
 	ac_camera_init(cam, center, 5000.0f, 45.0f, 30.0f, 60.0f, 100.0f, 400000.0f);
 	ac_terrain_sync(g_AcTerrain, cam->center, TRUE);
 	ac_object_sync(g_AcObject, cam->center, TRUE);

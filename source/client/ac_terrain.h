@@ -167,6 +167,14 @@ void ac_terrain_set_view_distance(
 
 float ac_terrain_get_view_distance(struct ac_terrain_module * mod);
 
+void ac_terrain_set_sector_grid(
+	struct ac_terrain_module * mod,
+	uint32_t min_x,
+	uint32_t min_z,
+	uint32_t width,
+	uint32_t height,
+	const boolean * grid);
+
 void ac_terrain_set_render_view(
 	struct ac_terrain_module * mod, 
 	enum ac_terrain_render_view view);

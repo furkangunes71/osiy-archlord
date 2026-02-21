@@ -2,4 +2,4 @@ ServerIniDir=content/server/ini
 ServerNodePath=content/server/world/node_data
 ClientDir=content/client
 
-EditorStartPosition=-387404.09,6831.68,98606.94
+EditorStartRegion=3

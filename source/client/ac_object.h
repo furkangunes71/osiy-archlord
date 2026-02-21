@@ -196,6 +196,16 @@ void ac_object_query_visible_objects(
 	struct ac_object_module * mod, 
 	struct ap_object *** objects);
 
+void ac_object_set_view_distance(struct ac_object_module * mod, float view_distance);
+
+void ac_object_set_sector_grid(
+	struct ac_object_module * mod,
+	uint32_t min_x,
+	uint32_t min_z,
+	uint32_t width,
+	uint32_t height,
+	const boolean * grid);
+
 void ac_object_sync(struct ac_object_module * mod, const vec3 pos, boolean force);
 
 void ac_object_update(struct ac_object_module * mod, float dt);

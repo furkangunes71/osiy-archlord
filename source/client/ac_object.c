@@ -63,6 +63,12 @@ struct ac_object_module {
 	struct ac_texture_module * ac_texture;
 	vec2 last_sync_pos;
 	float view_distance;
+	boolean has_sector_grid;
+	uint32_t grid_min_x;
+	uint32_t grid_min_z;
+	uint32_t grid_width;
+	uint32_t grid_height;
+	boolean * sector_grid;
 	struct ap_scr_index * visible_sectors;
 	struct ap_scr_index * visible_sectors_tmp;
 	struct ac_object_sector sectors[AP_SECTOR_WORLD_INDEX_WIDTH][AP_SECTOR_WORLD_INDEX_HEIGHT];
@@ -742,12 +748,19 @@ static void calc_visible_sectors(
 				continue;
 			if (ap_scr_distance(pos, sx, sz) > mod->view_distance)
 				continue;
+			if (mod->has_sector_grid) {
+				uint32_t gx = sx - mod->grid_min_x;
+				uint32_t gz = sz - mod->grid_min_z;
+				if (gx >= mod->grid_width || gz >= mod->grid_height ||
+					!mod->sector_grid[gz * mod->grid_width + gx])
+					continue;
+			}
 			idx.x = sx;
 			idx.z = sz;
 			vec_push_back(&mod->visible_sectors, &idx);
 		}
 	}
-	ap_scr_sort_indices(mod->visible_sectors, 
+	ap_scr_sort_indices(mod->visible_sectors,
 		vec_count(mod->visible_sectors));
 }
 
@@ -876,6 +889,11 @@ static boolean cbobjectinit(struct ac_object_module * mod, void * data)
 	struct ac_object_template * temp;
 	assert(obj != NULL);
 	assert(objc != NULL);
+	if (!obj->temp) {
+		WARN("Object (oid=%u, tid=%u) has NULL template, skipping.",
+			obj->object_id, obj->tid);
+		return TRUE;
+	}
 	temp = ac_object_get_template(obj->temp);
 	ac_object_reference_template(mod, temp);
 	return TRUE;
@@ -1425,8 +1443,32 @@ void ac_object_query_visible_objects(
 	}
 }
 
+void ac_object_set_view_distance(
+	struct ac_object_module * mod,
+	float view_distance)
+{
+	mod->view_distance = view_distance;
+}
+
+void ac_object_set_sector_grid(
+	struct ac_object_module * mod,
+	uint32_t min_x,
+	uint32_t min_z,
+	uint32_t width,
+	uint32_t height,
+	const boolean * grid)
+{
+	mod->has_sector_grid = TRUE;
+	mod->grid_min_x = min_x;
+	mod->grid_min_z = min_z;
+	mod->grid_width = width;
+	mod->grid_height = height;
+	mod->sector_grid = (boolean *)alloc(width * height * sizeof(boolean));
+	memcpy(mod->sector_grid, grid, width * height * sizeof(boolean));
+}
+
 void ac_object_sync(
-	struct ac_object_module * mod, 
+	struct ac_object_module * mod,
 	const vec3 pos, 
 	boolean force)
 {
