@@ -380,6 +380,7 @@
     <ClCompile Include="..\..\..\source\vendor\imgui\imgui_draw.cpp" />
     <ClCompile Include="..\..\..\source\vendor\imgui\imgui_tables.cpp" />
     <ClCompile Include="..\..\..\source\vendor\imgui\imgui_widgets.cpp" />
+    <ClCompile Include="..\..\..\source\vendor\parson\parson.c" />
     <ClCompile Include="..\..\..\source\vendor\pcg\pcg_basic.c" />
   </ItemGroup>
   <ItemGroup>

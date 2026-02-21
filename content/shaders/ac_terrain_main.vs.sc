@@ -21,6 +21,6 @@ void main()
 	v_texcoord2 = a_texcoord2;
 	v_texcoord3 = a_texcoord3;
 	v_texcoord4 = a_texcoord4;
-	v_texcoord5 = a_texcoord5;
+	v_texcoord5 = vec2(a_position.x, a_position.z);
 	v_color0 = do_light(normal.xyz);
 }

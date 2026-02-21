@@ -27,6 +27,9 @@
 #include "vendor/imgui/imgui.h"
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "vendor/imgui/imgui_internal.h"
+#include "vendor/parson/parson.h"
+
+#include <direct.h>
 
 #include <assert.h>
 #include <string.h>
@@ -195,11 +198,21 @@ struct tile_tool {
 	struct ac_terrain_tile_info tile;
 };
 
+#define MAX_TEXTURE_GROUPS 32
+#define TEXTURE_GROUP_NAME_LENGTH 64
+
+struct texture_group {
+	char name[TEXTURE_GROUP_NAME_LENGTH];
+	bgfx_texture_handle_t * textures;
+	char (* pending_tex_names)[64]; /* vec - names to resolve */
+};
+
 struct ae_terrain_module {
 	struct ap_module_instance instance;
 	struct ap_map_module * ap_map;
 	struct ac_mesh_module * ac_mesh;
 	struct ac_render_module * ac_render;
+	struct ac_camera_module * ac_camera;
 	struct ac_terrain_module * ac_terrain;
 	struct ac_texture_module * ac_texture;
 	struct ae_editor_action_module * ae_editor_action;
@@ -216,7 +229,30 @@ struct ae_terrain_module {
 	struct tile_tool * tile;
 	bgfx_texture_handle_t interp_tex[INTERP_COUNT];
 	bgfx_texture_info_t interp_info[INTERP_COUNT];
+	uint32_t active_region_id;
+	uint32_t pending_region_id;
+	boolean region_changed;
+	struct ac_terrain_sector ** cached_sectors;
+	uint32_t cached_sector_count;
+	bgfx_texture_handle_t * region_textures;
+	bool browse_region_textures;
+	bgfx_texture_handle_t highlight_texture;
+	float highlight_opacity;
+	float highlight_color[3];
+	bgfx_program_handle_t highlight_program;
+	bgfx_uniform_handle_t highlight_uniform;
+	struct texture_group tex_groups[MAX_TEXTURE_GROUPS];
+	uint32_t tex_group_count;
+	bool show_layer_window;
+	char new_layer_name[TEXTURE_GROUP_NAME_LENGTH];
+	bool show_export_confirm;
+	float export_msg_timer;
 };
+
+static void load_layer_definitions(struct ae_terrain_module * mod);
+static void resolve_pending_textures(struct ae_terrain_module * mod);
+static void save_region_layers(struct ae_terrain_module * mod);
+static void load_region_layers(struct ae_terrain_module * mod);
 
 static struct paint_tile_info PAINT_TILES[] = {
 	{ { 0.75f, 0.0f }, { 1.0f, 0.25f }, PAINT_TILE_TOP_LEFT },
@@ -559,8 +595,8 @@ static boolean cbcustomrendertile(
 
 static void render_tile(struct ae_terrain_module * mod)
 {
-	ac_terrain_custom_render(mod->ac_terrain, mod, 
-		(ap_module_default_t)cbcustomrendertile);
+	ac_terrain_custom_render(mod->ac_terrain, mod,
+		(ap_module_default_t)cbcustomrendertile, FALSE);
 }
 
 void render_tile_toolbar(struct ae_terrain_module * mod)
@@ -793,6 +829,26 @@ static boolean create_shaders(struct ae_terrain_module * mod)
 		ERROR("Failed to create sampler (s_texSegment).");
 		return FALSE;
 	}
+	if (!ac_render_load_shader("ae_terrain_tex_highlight.vs", &vsh)) {
+		ERROR("Failed to load tex highlight vertex shader.");
+		return FALSE;
+	}
+	if (!ac_render_load_shader("ae_terrain_tex_highlight.fs", &fsh)) {
+		ERROR("Failed to load tex highlight fragment shader.");
+		return FALSE;
+	}
+	mod->highlight_program = bgfx_create_program(vsh, fsh, true);
+	if (!BGFX_HANDLE_IS_VALID(mod->highlight_program)) {
+		ERROR("Failed to create tex highlight program.");
+		return FALSE;
+	}
+	mod->highlight_uniform = bgfx_create_uniform(
+		"u_highlightInfo", BGFX_UNIFORM_TYPE_VEC4, 1);
+	if (!BGFX_HANDLE_IS_VALID(mod->highlight_uniform)) {
+		ERROR("Failed to create highlight uniform.");
+		return FALSE;
+	}
+	load_layer_definitions(mod);
 	return TRUE;
 }
 
@@ -1673,12 +1729,83 @@ static void rebuild_segment_textures(
 	dealloc(tex_data);
 }
 
+/* Rebuild the GPU segment mask from loaded sector segment_info.
+ * This ensures the GPU mask matches the CPU segment_info data
+ * (compact segment files may differ from node_data). */
+static void rebuild_segment_mask(
+	struct ae_terrain_module * mod,
+	struct ac_terrain_sector ** sectors,
+	uint32_t sector_count)
+{
+	uint32_t i;
+	uint32_t smin_x = UINT32_MAX, smin_z = UINT32_MAX;
+	uint32_t smax_x = 0, smax_z = 0;
+	uint32_t gw, gh, tex_dim;
+	uint8_t * mask;
+	float begin_x, begin_z, len, len_z;
+	if (mod->active_region_id == UINT32_MAX || !sector_count)
+		return;
+	/* Find sector bounds. */
+	for (i = 0; i < sector_count; i++) {
+		uint32_t ix = sectors[i]->index_x;
+		uint32_t iz = sectors[i]->index_z;
+		if (ix < smin_x) smin_x = ix;
+		if (ix > smax_x) smax_x = ix;
+		if (iz < smin_z) smin_z = iz;
+		if (iz > smax_z) smax_z = iz;
+	}
+	gw = smax_x - smin_x + 1;
+	gh = smax_z - smin_z + 1;
+	tex_dim = (gw > gh ? gw : gh) * 16;
+	mask = (uint8_t *)alloc(tex_dim * tex_dim);
+	memset(mask, 0, tex_dim * tex_dim);
+	for (i = 0; i < sector_count; i++) {
+		struct ac_terrain_sector * s = sectors[i];
+		uint32_t sz, sx;
+		if (!s->segment_info)
+			continue;
+		for (sz = 0; sz < 16; sz++) {
+			for (sx = 0; sx < 16; sx++) {
+				if (s->segment_info->segments[sx][sz].region_id ==
+					mod->active_region_id) {
+					uint32_t mx = (s->index_x - smin_x) * 16 + sx;
+					uint32_t mz = (s->index_z - smin_z) * 16 + sz;
+					mask[mz * tex_dim + mx] = 255;
+				}
+			}
+		}
+	}
+	begin_x = (float)(AP_SECTOR_WORLD_START_X +
+		smin_x * AP_SECTOR_WIDTH);
+	begin_z = (float)(AP_SECTOR_WORLD_START_Z +
+		smin_z * AP_SECTOR_HEIGHT);
+	len = (float)(gw * AP_SECTOR_WIDTH);
+	len_z = (float)(gh * AP_SECTOR_HEIGHT);
+	if (len_z > len)
+		len = len_z;
+	ac_terrain_set_segment_mask(mod->ac_terrain,
+		mask, tex_dim, tex_dim, begin_x, begin_z, len);
+	dealloc(mask);
+}
+
 static boolean cb_post_load_sector(
-	struct ae_terrain_module * mod, 
+	struct ae_terrain_module * mod,
 	struct ac_terrain_cb_post_load_sector * data)
 {
 	rebuild_segment_textures(mod, data->sectors, data->sector_count);
 	rebuild_tile_tex(mod, data->sectors, data->sector_count);
+	if (mod->cached_sectors) {
+		dealloc(mod->cached_sectors);
+		mod->cached_sectors = NULL;
+	}
+	mod->cached_sector_count = data->sector_count;
+	if (data->sector_count) {
+		size_t sz = data->sector_count * sizeof(*mod->cached_sectors);
+		mod->cached_sectors = (struct ac_terrain_sector **)alloc(sz);
+		memcpy(mod->cached_sectors, data->sectors, sz);
+	}
+	rebuild_segment_mask(mod, data->sectors, data->sector_count);
+	resolve_pending_textures(mod);
 	return TRUE;
 }
 
@@ -1741,6 +1868,7 @@ static boolean onregister(
 	struct ap_module_registry * registry)
 {
 	AP_MODULE_INSTANCE_FIND_IN_REGISTRY(registry, mod->ap_map, AP_MAP_MODULE_NAME);
+	AP_MODULE_INSTANCE_FIND_IN_REGISTRY(registry, mod->ac_camera, AC_CAMERA_MODULE_NAME);
 	AP_MODULE_INSTANCE_FIND_IN_REGISTRY(registry, mod->ac_mesh, AC_MESH_MODULE_NAME);
 	AP_MODULE_INSTANCE_FIND_IN_REGISTRY(registry, mod->ac_render, AC_RENDER_MODULE_NAME);
 	AP_MODULE_INSTANCE_FIND_IN_REGISTRY(registry, mod->ac_terrain, AC_TERRAIN_MODULE_NAME);
@@ -1856,9 +1984,22 @@ static void onshutdown(struct ae_terrain_module * mod)
 	bgfx_destroy_program(mod->region.program);
 	bgfx_destroy_uniform(mod->region.uniform);
 	bgfx_destroy_uniform(mod->region.sampler);
+	bgfx_destroy_program(mod->highlight_program);
+	bgfx_destroy_uniform(mod->highlight_uniform);
 	for (i = 0; i < COUNT_OF(mod->segment_tex); i++) {
 		if (BGFX_HANDLE_IS_VALID(mod->segment_tex[i]))
 			bgfx_destroy_texture(mod->segment_tex[i]);
+	}
+	vec_free(mod->region_textures);
+	if (mod->cached_sectors) {
+		dealloc(mod->cached_sectors);
+		mod->cached_sectors = NULL;
+	}
+	for (i = 0; i < mod->tex_group_count; i++) {
+		if (mod->tex_groups[i].textures)
+			vec_free(mod->tex_groups[i].textures);
+		if (mod->tex_groups[i].pending_tex_names)
+			vec_free(mod->tex_groups[i].pending_tex_names);
 	}
 	destroy_tile_tool(mod);
 }
@@ -1899,11 +2040,23 @@ struct ae_terrain_module * ae_terrain_create_module()
 	init_color_bucket(&mod->region.bucket);
 	for (i = 0; i < COUNT_OF(mod->region.colors); i++)
 		mod->region.colors[i].color_index = UINT32_MAX;
+	mod->active_region_id = UINT32_MAX;
+	mod->pending_region_id = UINT32_MAX;
+	mod->region_changed = FALSE;
+	mod->region_textures = (bgfx_texture_handle_t *)vec_new_reserved(
+		sizeof(*mod->region_textures), 64);
+	BGFX_INVALIDATE_HANDLE(mod->highlight_texture);
+	mod->highlight_opacity = 0.3f;
+	mod->highlight_color[0] = 1.0f;
+	mod->highlight_color[1] = 1.0f;
+	mod->highlight_color[2] = 1.0f;
 	return mod;
 }
 
 void ae_terrain_update(struct ae_terrain_module * mod, float dt)
 {
+	if (mod->export_msg_timer > 0.f)
+		mod->export_msg_timer -= dt;
 	switch (mod->edit_mode) {
 	case EDIT_MODE_HEIGHT:
 		if (mod->height.preview &&
@@ -2012,6 +2165,117 @@ static boolean cbcustomrenderregion(
 	return TRUE;
 }
 
+/* Check if any vertex of a triangle with the given material_index
+ * falls within a segment belonging to the active region.
+ * Uses per-vertex checks (inclusive) for highlight rendering
+ * where the GPU segment mask does final per-fragment clipping. */
+static boolean is_material_in_region(
+	const struct ac_terrain_sector * sector,
+	const struct ac_mesh_geometry * geo,
+	uint32_t material_index,
+	uint32_t region_id)
+{
+	uint32_t i;
+	if (!sector->segment_info || region_id == UINT32_MAX)
+		return TRUE;
+	for (i = 0; i < geo->triangle_count; i++) {
+		const struct ac_mesh_triangle * tri = &geo->triangles[i];
+		uint32_t v;
+		if (tri->material_index != material_index)
+			continue;
+		for (v = 0; v < 3; v++) {
+			float px = geo->vertices[tri->indices[v]].position[0];
+			float pz = geo->vertices[tri->indices[v]].position[2];
+			int sx = (int)((px - sector->extent_start[0]) /
+				AP_SECTOR_STEPSIZE);
+			int sz = (int)((pz - sector->extent_start[1]) /
+				AP_SECTOR_STEPSIZE);
+			if (sx < 0) sx = 0;
+			if (sx > 15) sx = 15;
+			if (sz < 0) sz = 0;
+			if (sz > 15) sz = 15;
+			if (sector->segment_info->segments[sx][sz].region_id ==
+				region_id)
+				return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+/* Stricter centroid-based check for texture list filtering.
+ * Only returns TRUE if a triangle centroid is in the active region,
+ * which better matches what is actually visible in the viewport. */
+static boolean is_material_visible_in_region(
+	const struct ac_terrain_sector * sector,
+	const struct ac_mesh_geometry * geo,
+	uint32_t material_index,
+	uint32_t region_id)
+{
+	uint32_t i;
+	if (!sector->segment_info || region_id == UINT32_MAX)
+		return TRUE;
+	for (i = 0; i < geo->triangle_count; i++) {
+		const struct ac_mesh_triangle * tri = &geo->triangles[i];
+		float cx;
+		float cz;
+		int sx;
+		int sz;
+		if (tri->material_index != material_index)
+			continue;
+		cx = (geo->vertices[tri->indices[0]].position[0] +
+			geo->vertices[tri->indices[1]].position[0] +
+			geo->vertices[tri->indices[2]].position[0]) / 3.0f;
+		cz = (geo->vertices[tri->indices[0]].position[2] +
+			geo->vertices[tri->indices[1]].position[2] +
+			geo->vertices[tri->indices[2]].position[2]) / 3.0f;
+		sx = (int)((cx - sector->extent_start[0]) /
+			AP_SECTOR_STEPSIZE);
+		sz = (int)((cz - sector->extent_start[1]) /
+			AP_SECTOR_STEPSIZE);
+		if (sx < 0) sx = 0;
+		if (sx > 15) sx = 15;
+		if (sz < 0) sz = 0;
+		if (sz > 15) sz = 15;
+		if (sector->segment_info->segments[sx][sz].region_id ==
+			region_id)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static boolean cbcustomrenderhighlight(
+	struct ae_terrain_module * mod,
+	struct ac_terrain_cb_custom_render * cb)
+{
+	uint32_t i;
+	vec4 uniform = { mod->highlight_opacity,
+		mod->highlight_color[0], mod->highlight_color[1],
+		mod->highlight_color[2] };
+	/* Check if this material uses the highlighted texture. */
+	for (i = 0; i < COUNT_OF(cb->material->tex_handle); i++) {
+		if (BGFX_HANDLE_IS_VALID(cb->material->tex_handle[i]) &&
+			cb->material->tex_handle[i].idx == mod->highlight_texture.idx) {
+			/* Skip if split is not in the active region. */
+			if (!is_material_in_region(cb->sector, cb->geometry,
+					cb->split->material_index,
+					mod->active_region_id))
+				return FALSE;
+			cb->state = BGFX_STATE_WRITE_RGB |
+				BGFX_STATE_DEPTH_TEST_LEQUAL |
+				BGFX_STATE_CULL_CW |
+				BGFX_STATE_BLEND_FUNC_SEPARATE(
+					BGFX_STATE_BLEND_SRC_ALPHA,
+					BGFX_STATE_BLEND_INV_SRC_ALPHA,
+					BGFX_STATE_BLEND_ZERO,
+					BGFX_STATE_BLEND_ONE);
+			cb->program = mod->highlight_program;
+			bgfx_set_uniform(mod->highlight_uniform, uniform, 1);
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
 void ae_terrain_render(struct ae_terrain_module * mod, struct ac_camera * cam)
 {
 	switch (mod->edit_mode) {
@@ -2031,8 +2295,8 @@ void ae_terrain_render(struct ae_terrain_module * mod, struct ac_camera * cam)
 		uint32_t i;
 		struct paint_tool * p = &mod->paint;
 		uint32_t count;
-		ac_terrain_custom_render(mod->ac_terrain, mod, 
-			(ap_module_default_t)cbcustomrenderpaint);
+		ac_terrain_custom_render(mod->ac_terrain, mod,
+			(ap_module_default_t)cbcustomrenderpaint, FALSE);
 		count = vec_count(p->vertices);
 		if (!count)
 			break;
@@ -2059,23 +2323,27 @@ void ae_terrain_render(struct ae_terrain_module * mod, struct ac_camera * cam)
 		break;
 	}
 	case EDIT_MODE_HEIGHT: {
-		ac_terrain_custom_render(mod->ac_terrain, mod, 
-			(ap_module_default_t)cbcustomrenderheight);
+		ac_terrain_custom_render(mod->ac_terrain, mod,
+			(ap_module_default_t)cbcustomrenderheight, FALSE);
 		break;
 	}
 	case EDIT_MODE_LEVEL: {
-		ac_terrain_custom_render(mod->ac_terrain, mod, 
-			(ap_module_default_t)cbcustomrenderlevel);
+		ac_terrain_custom_render(mod->ac_terrain, mod,
+			(ap_module_default_t)cbcustomrenderlevel, FALSE);
 		break;
 	}
 	case EDIT_MODE_REGION: {
-		ac_terrain_custom_render(mod->ac_terrain, mod, 
-			(ap_module_default_t)cbcustomrenderregion);
+		ac_terrain_custom_render(mod->ac_terrain, mod,
+			(ap_module_default_t)cbcustomrenderregion, FALSE);
 		break;
 	}
 	case EDIT_MODE_TILE:
 		render_tile(mod);
 		break;
+	}
+	if (BGFX_HANDLE_IS_VALID(mod->highlight_texture)) {
+		ac_terrain_custom_render(mod->ac_terrain, mod,
+			(ap_module_default_t)cbcustomrenderhighlight, TRUE);
 	}
 }
 
@@ -2421,6 +2689,551 @@ static void browsemaskedtextures(
 			paint->browse_masked_textures = false;
 			break;
 		}
+	}
+	ImGui::End();
+}
+
+static void browserregiontextures(struct ae_terrain_module * mod)
+{
+	ImVec2 size = ImVec2(580.0f, 580.0f);
+	uint32_t i;
+	uint32_t count;
+	ImGui::SetNextWindowSize(size, ImGuiCond_FirstUseEver);
+	if (!ImGui::Begin("Region Textures", &mod->browse_region_textures)) {
+		ImGui::End();
+		return;
+	}
+	/* Collect unique textures from visible sectors.
+	 * Only include materials used by segments that belong
+	 * to the active region. */
+	vec_clear(mod->region_textures);
+	for (i = 0; i < mod->cached_sector_count; i++) {
+		struct ac_terrain_sector * s = mod->cached_sectors[i];
+		struct ac_mesh_geometry * g;
+		if (!(s->flags & AC_TERRAIN_SECTOR_DETAIL_IS_LOADED))
+			continue;
+		g = s->geometry;
+		while (g) {
+			uint32_t mi;
+			for (mi = 0; mi < g->material_count; mi++) {
+				uint32_t ti;
+				if (!is_material_visible_in_region(s, g, mi,
+						mod->active_region_id))
+					continue;
+				for (ti = 0; ti < 5; ti++) {
+					bgfx_texture_handle_t tex =
+						g->materials[mi].tex_handle[ti];
+					uint32_t k;
+					boolean add = TRUE;
+					if (!BGFX_HANDLE_IS_VALID(tex))
+						continue;
+					for (k = 0;
+						k < vec_count(mod->region_textures);
+						k++) {
+						if (mod->region_textures[k].idx ==
+							tex.idx) {
+							add = FALSE;
+							break;
+						}
+					}
+					if (add)
+						vec_push_back(
+							(void **)&mod->region_textures,
+							&tex);
+				}
+			}
+			g = g->next;
+		}
+	}
+	count = vec_count(mod->region_textures);
+	for (i = 0; i < count; i++) {
+		ImVec2 avail;
+		bgfx_texture_handle_t tex = mod->region_textures[i];
+		boolean is_selected = BGFX_HANDLE_IS_VALID(mod->highlight_texture) &&
+			mod->highlight_texture.idx == tex.idx;
+		if (i)
+			ImGui::SameLine(0.0f, -1.0f);
+		avail = ImGui::GetContentRegionAvail();
+		if (avail.x < 128.f)
+			ImGui::NewLine();
+		if (BGFX_HANDLE_IS_VALID(tex)) {
+			ImVec4 border = is_selected ?
+				ImVec4(1.f, 1.f, 0.f, 1.f) :
+				ImVec4(.2f, 0.2f, 0.2f, 0.2f);
+			ImGui::Image((ImTextureID)(uintptr_t)tex.idx,
+				ImVec2(128.f, 128.f),
+				ImVec2(0.f, 0.f), ImVec2(1.f, 1.f),
+				ImVec4(1.f, 1.f, 1.f, 1.f),
+				border);
+			if (ImGui::BeginDragDropSource(
+					ImGuiDragDropFlags_SourceAllowNullID)) {
+				ImGui::SetDragDropPayload("TEX_HANDLE", &tex,
+					sizeof(bgfx_texture_handle_t));
+				ImGui::Image((ImTextureID)(uintptr_t)tex.idx,
+					ImVec2(64.f, 64.f));
+				ImGui::EndDragDropSource();
+			}
+		}
+		else {
+			ImGui::Dummy(ImVec2(128.f, 128.f));
+		}
+		if (ImGui::IsItemHovered()) {
+			char name[64];
+			if (ac_texture_get_name(mod->ac_texture, tex, TRUE,
+					name, sizeof(name)) &&
+				ImGui::BeginTooltip()) {
+				ImGui::Text("Name: %s", name);
+				ImGui::EndTooltip();
+			}
+		}
+		if (ImGui::IsItemHovered() &&
+			ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+			/* Double-click: teleport to first sector/segment
+			 * using this texture in the active region. */
+			uint32_t si;
+			boolean tp_done = FALSE;
+			for (si = 0; si < mod->cached_sector_count && !tp_done;
+				si++) {
+				struct ac_terrain_sector * s =
+					mod->cached_sectors[si];
+				struct ac_mesh_geometry * geo;
+				if (!(s->flags &
+						AC_TERRAIN_SECTOR_DETAIL_IS_LOADED))
+					continue;
+				geo = s->geometry;
+				while (geo && !tp_done) {
+					uint32_t mi;
+					for (mi = 0; mi < geo->material_count;
+						mi++) {
+						uint32_t ti2;
+						boolean has_tex = FALSE;
+						for (ti2 = 0; ti2 < 6; ti2++) {
+							if (BGFX_HANDLE_IS_VALID(
+								geo->materials[mi]
+									.tex_handle[ti2]) &&
+								geo->materials[mi]
+									.tex_handle[ti2].idx ==
+								tex.idx) {
+								has_tex = TRUE;
+								break;
+							}
+						}
+						if (!has_tex)
+							continue;
+						if (!is_material_in_region(s, geo,
+								mi, mod->active_region_id))
+							continue;
+						{
+							struct ac_camera * cam =
+								ac_camera_get_main(
+									mod->ac_camera);
+							vec3 center;
+							center[0] =
+								(s->extent_start[0] +
+								s->extent_end[0]) * 0.5f;
+							center[1] =
+								geo->bsphere.center.y;
+							center[2] =
+								(s->extent_start[1] +
+								s->extent_end[1]) * 0.5f;
+							ac_camera_focus_on(cam,
+								center, 3000.f);
+							tp_done = TRUE;
+							break;
+						}
+					}
+					geo = geo->next;
+				}
+			}
+		}
+		else if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+			if (is_selected)
+				BGFX_INVALIDATE_HANDLE(mod->highlight_texture);
+			else
+				mod->highlight_texture = tex;
+		}
+	}
+	ImGui::End();
+}
+
+static void save_layer_definitions(struct ae_terrain_module * mod)
+{
+	JSON_Value * root = json_value_init_object();
+	JSON_Object * obj = json_value_get_object(root);
+	JSON_Value * arr_val = json_value_init_array();
+	JSON_Array * arr = json_value_get_array(arr_val);
+	uint32_t i;
+	for (i = 0; i < mod->tex_group_count; i++)
+		json_array_append_string(arr, mod->tex_groups[i].name);
+	json_object_set_value(obj, "layers", arr_val);
+	_mkdir("export");
+	_mkdir("export/terrain");
+	json_serialize_to_file_pretty(root,
+		"export/terrain/texture_layers.json");
+	json_value_free(root);
+}
+
+static void save_region_layers(struct ae_terrain_module * mod)
+{
+	char dir[256];
+	char path[512];
+	JSON_Value * root;
+	JSON_Object * root_obj;
+	JSON_Value * groups_val;
+	JSON_Array * groups_arr;
+	uint32_t gi;
+	if (mod->active_region_id == UINT32_MAX)
+		return;
+	root = json_value_init_object();
+	root_obj = json_value_get_object(root);
+	groups_val = json_value_init_array();
+	groups_arr = json_value_get_array(groups_val);
+	for (gi = 0; gi < mod->tex_group_count; gi++) {
+		struct texture_group * g = &mod->tex_groups[gi];
+		JSON_Value * group_val = json_value_init_object();
+		JSON_Object * group_obj = json_value_get_object(group_val);
+		JSON_Value * tex_arr_val = json_value_init_array();
+		JSON_Array * tex_arr = json_value_get_array(tex_arr_val);
+		uint32_t ti;
+		json_object_set_string(group_obj, "name", g->name);
+		for (ti = 0; ti < vec_count(g->textures); ti++) {
+			char name[64];
+			if (ac_texture_get_name(mod->ac_texture, g->textures[ti],
+					TRUE, name, sizeof(name)))
+				json_array_append_string(tex_arr, name);
+		}
+		json_object_set_value(group_obj, "textures", tex_arr_val);
+		json_array_append_value(groups_arr, group_val);
+	}
+	json_object_set_value(root_obj, "groups", groups_val);
+	snprintf(dir, sizeof(dir), "export/terrain/%u",
+		mod->active_region_id);
+	_mkdir("export");
+	_mkdir("export/terrain");
+	_mkdir(dir);
+	snprintf(path, sizeof(path), "%s/texture_layers.json", dir);
+	json_serialize_to_file_pretty(root, path);
+	json_value_free(root);
+}
+
+static void load_region_layers(struct ae_terrain_module * mod)
+{
+	char path[512];
+	JSON_Value * root;
+	JSON_Object * root_obj;
+	JSON_Array * groups_arr;
+	size_t gc;
+	size_t gi;
+	if (mod->active_region_id == UINT32_MAX)
+		return;
+	snprintf(path, sizeof(path), "export/terrain/%u/texture_layers.json",
+		mod->active_region_id);
+	root = json_parse_file(path);
+	if (!root)
+		return;
+	root_obj = json_value_get_object(root);
+	groups_arr = json_object_get_array(root_obj, "groups");
+	if (!groups_arr) {
+		json_value_free(root);
+		return;
+	}
+	gc = json_array_get_count(groups_arr);
+	for (gi = 0; gi < gc && gi < mod->tex_group_count; gi++) {
+		JSON_Object * group_obj = json_array_get_object(groups_arr, gi);
+		JSON_Array * tex_arr;
+		size_t tc;
+		size_t ti;
+		struct texture_group * g;
+		const char * name;
+		uint32_t li;
+		boolean found = FALSE;
+		if (!group_obj)
+			continue;
+		name = json_object_get_string(group_obj, "name");
+		if (!name)
+			continue;
+		/* Find matching layer by name. */
+		for (li = 0; li < mod->tex_group_count; li++) {
+			if (strcmp(mod->tex_groups[li].name, name) == 0) {
+				found = TRUE;
+				break;
+			}
+		}
+		if (!found)
+			continue;
+		g = &mod->tex_groups[li];
+		tex_arr = json_object_get_array(group_obj, "textures");
+		if (!tex_arr)
+			continue;
+		tc = json_array_get_count(tex_arr);
+		for (ti = 0; ti < tc; ti++) {
+			const char * tex_name = json_array_get_string(tex_arr, ti);
+			char pn[64];
+			if (!tex_name)
+				continue;
+			strlcpy(pn, tex_name, sizeof(pn));
+			vec_push_back((void **)&g->pending_tex_names, &pn);
+		}
+	}
+	json_value_free(root);
+	INFO("Loaded region layer textures from: %s", path);
+}
+
+static void resolve_pending_textures(struct ae_terrain_module * mod)
+{
+	uint32_t gi;
+	for (gi = 0; gi < mod->tex_group_count; gi++) {
+		struct texture_group * g = &mod->tex_groups[gi];
+		uint32_t pi;
+		if (!g->pending_tex_names ||
+			vec_count(g->pending_tex_names) == 0)
+			continue;
+		for (pi = 0; pi < vec_count(g->pending_tex_names); ) {
+			const char * pname = g->pending_tex_names[pi];
+			boolean resolved = FALSE;
+			uint32_t si;
+			for (si = 0; si < mod->cached_sector_count && !resolved;
+				si++) {
+				struct ac_terrain_sector * s =
+					mod->cached_sectors[si];
+				struct ac_mesh_geometry * geo;
+				if (!(s->flags &
+						AC_TERRAIN_SECTOR_DETAIL_IS_LOADED))
+					continue;
+				geo = s->geometry;
+				while (geo && !resolved) {
+					uint32_t mi;
+					for (mi = 0; mi < geo->material_count; mi++) {
+						uint32_t ti;
+						for (ti = 0; ti < 6; ti++) {
+							bgfx_texture_handle_t tex =
+								geo->materials[mi].tex_handle[ti];
+							char tname[64];
+							boolean dup;
+							uint32_t k;
+							if (!BGFX_HANDLE_IS_VALID(tex))
+								continue;
+							if (!ac_texture_get_name(
+									mod->ac_texture, tex, TRUE,
+									tname, sizeof(tname)))
+								continue;
+							if (strcmp(tname, pname) != 0)
+								continue;
+							/* Check duplicate. */
+							dup = FALSE;
+							for (k = 0;
+								k < vec_count(g->textures);
+								k++) {
+								if (g->textures[k].idx ==
+									tex.idx) {
+									dup = TRUE;
+									break;
+								}
+							}
+							if (!dup)
+								vec_push_back(
+									(void **)&g->textures,
+									&tex);
+							resolved = TRUE;
+							break;
+						}
+						if (resolved)
+							break;
+					}
+					geo = geo->next;
+				}
+			}
+			if (resolved)
+				pi = vec_erase_iterator(g->pending_tex_names, pi);
+			else
+				pi++;
+		}
+	}
+}
+
+static void load_layer_definitions(struct ae_terrain_module * mod)
+{
+	JSON_Value * root = json_parse_file(
+		"export/terrain/texture_layers.json");
+	JSON_Object * obj;
+	JSON_Array * arr;
+	size_t count;
+	size_t i;
+	if (!root)
+		return;
+	obj = json_value_get_object(root);
+	arr = json_object_get_array(obj, "layers");
+	if (!arr) {
+		json_value_free(root);
+		return;
+	}
+	count = json_array_get_count(arr);
+	for (i = 0; i < count &&
+		mod->tex_group_count < MAX_TEXTURE_GROUPS; i++) {
+		const char * name = json_array_get_string(arr, i);
+		struct texture_group * g;
+		if (!name)
+			continue;
+		g = &mod->tex_groups[mod->tex_group_count++];
+		strlcpy(g->name, name, sizeof(g->name));
+		g->textures = (bgfx_texture_handle_t *)vec_new_reserved(
+			sizeof(*g->textures), 16);
+		g->pending_tex_names = (char (*)[64])vec_new_reserved(
+			64, 16);
+	}
+	json_value_free(root);
+	INFO("Loaded %u texture layers.", mod->tex_group_count);
+}
+
+static void export_texture_groups(struct ae_terrain_module * mod)
+{
+	char dir[256];
+	char path[512];
+	JSON_Value * root = json_value_init_object();
+	JSON_Object * root_obj = json_value_get_object(root);
+	JSON_Value * groups_val = json_value_init_array();
+	JSON_Array * groups_arr = json_value_get_array(groups_val);
+	uint32_t gi;
+	for (gi = 0; gi < mod->tex_group_count; gi++) {
+		struct texture_group * g = &mod->tex_groups[gi];
+		JSON_Value * group_val = json_value_init_object();
+		JSON_Object * group_obj = json_value_get_object(group_val);
+		JSON_Value * tex_arr_val = json_value_init_array();
+		JSON_Array * tex_arr = json_value_get_array(tex_arr_val);
+		uint32_t ti;
+		json_object_set_string(group_obj, "name", g->name);
+		for (ti = 0; ti < vec_count(g->textures); ti++) {
+			char name[64];
+			if (ac_texture_get_name(mod->ac_texture, g->textures[ti],
+					TRUE, name, sizeof(name)))
+				json_array_append_string(tex_arr, name);
+		}
+		json_object_set_value(group_obj, "textures", tex_arr_val);
+		json_array_append_value(groups_arr, group_val);
+	}
+	json_object_set_value(root_obj, "groups", groups_val);
+	snprintf(dir, sizeof(dir), "export/terrain/%u",
+		mod->active_region_id);
+	_mkdir("export");
+	_mkdir("export/terrain");
+	_mkdir(dir);
+	snprintf(path, sizeof(path), "%s/texture_layers.json", dir);
+	json_serialize_to_file_pretty(root, path);
+	json_value_free(root);
+	INFO("Exported texture groups to: %s", path);
+}
+
+static void render_layer_window(struct ae_terrain_module * mod)
+{
+	uint32_t gi;
+	ImGui::SetNextWindowSize(ImVec2(580.f, 580.f), ImGuiCond_FirstUseEver);
+	if (!ImGui::Begin("Texture Layers", &mod->show_layer_window)) {
+		ImGui::End();
+		return;
+	}
+	/* Add new layer. */
+	ImGui::InputText("##newlayer", mod->new_layer_name,
+		sizeof(mod->new_layer_name));
+	ImGui::SameLine();
+	if (ImGui::Button("Add Layer") &&
+		mod->new_layer_name[0] != '\0' &&
+		mod->tex_group_count < MAX_TEXTURE_GROUPS) {
+		struct texture_group * g =
+			&mod->tex_groups[mod->tex_group_count++];
+		strlcpy(g->name, mod->new_layer_name, sizeof(g->name));
+		g->textures = (bgfx_texture_handle_t *)vec_new_reserved(
+			sizeof(*g->textures), 16);
+		g->pending_tex_names = (char (*)[64])vec_new_reserved(
+			64, 16);
+		mod->new_layer_name[0] = '\0';
+		save_layer_definitions(mod);
+	}
+	ImGui::Separator();
+	/* Tab bar - one tab per layer. */
+	if (ImGui::BeginTabBar("##layers")) {
+		for (gi = 0; gi < mod->tex_group_count; gi++) {
+			struct texture_group * g = &mod->tex_groups[gi];
+			if (ImGui::BeginTabItem(g->name)) {
+				uint32_t i;
+				uint32_t count = vec_count(g->textures);
+				ImVec2 avail;
+				char drop_id[32];
+				for (i = 0; i < count; i++) {
+					bgfx_texture_handle_t tex = g->textures[i];
+					if (i)
+						ImGui::SameLine(0.0f, -1.0f);
+					avail = ImGui::GetContentRegionAvail();
+					if (avail.x < 128.f)
+						ImGui::NewLine();
+					if (BGFX_HANDLE_IS_VALID(tex)) {
+						ImGui::Image(
+							(ImTextureID)(uintptr_t)tex.idx,
+							ImVec2(128.f, 128.f),
+							ImVec2(0.f, 0.f),
+							ImVec2(1.f, 1.f),
+							ImVec4(1.f, 1.f, 1.f, 1.f),
+							ImVec4(.2f, 0.2f, 0.2f, 0.2f));
+					}
+					else {
+						ImGui::Dummy(ImVec2(128.f, 128.f));
+					}
+					if (ImGui::IsItemHovered()) {
+						char name[64];
+						if (ac_texture_get_name(
+								mod->ac_texture, tex, TRUE,
+								name, sizeof(name)) &&
+							ImGui::BeginTooltip()) {
+							ImGui::Text("Name: %s", name);
+							ImGui::EndTooltip();
+						}
+					}
+					if (ImGui::IsItemClicked(
+							ImGuiMouseButton_Right)) {
+						i = vec_erase_iterator(
+							g->textures, i);
+						count--;
+						save_region_layers(mod);
+					}
+				}
+				/* Drop target area. */
+				avail = ImGui::GetContentRegionAvail();
+				if (avail.y < 40.f)
+					avail.y = 40.f;
+				snprintf(drop_id, sizeof(drop_id),
+					"##drop_%u", gi);
+				ImGui::InvisibleButton(drop_id, avail);
+				if (ImGui::BeginDragDropTarget()) {
+					const ImGuiPayload * payload =
+						ImGui::AcceptDragDropPayload(
+							"TEX_HANDLE");
+					if (payload) {
+						bgfx_texture_handle_t tex =
+							*(bgfx_texture_handle_t *)
+								payload->Data;
+						uint32_t k;
+						boolean found = FALSE;
+						for (k = 0;
+							k < vec_count(g->textures);
+							k++) {
+							if (g->textures[k].idx ==
+								tex.idx) {
+								found = TRUE;
+								break;
+							}
+						}
+						if (!found) {
+							vec_push_back(
+								(void **)&g->textures,
+								&tex);
+							save_region_layers(mod);
+						}
+					}
+					ImGui::EndDragDropTarget();
+				}
+				ImGui::EndTabItem();
+			}
+		}
+		ImGui::EndTabBar();
 	}
 	ImGui::End();
 }
@@ -2771,6 +3584,133 @@ void ae_terrain_toolbar(struct ae_terrain_module * mod)
 	case EDIT_MODE_TILE:
 		render_tile_toolbar(mod);
 		break;
+	default: {
+		char label[256] = "All Regions";
+		uint32_t i;
+		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, 5.f));
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(200.f);
+		if (mod->active_region_id != UINT32_MAX) {
+			struct ap_map_region_template * t =
+				ap_map_get_region_template(mod->ap_map, mod->active_region_id);
+			if (t)
+				snprintf(label, sizeof(label), "[%u] %s", t->id, t->glossary);
+			else
+				snprintf(label, sizeof(label), "[%u]", mod->active_region_id);
+		}
+		if (ImGui::BeginCombo("Region", label)) {
+			if (ImGui::Selectable("All Regions", mod->active_region_id == UINT32_MAX)) {
+				mod->pending_region_id = UINT32_MAX;
+				mod->region_changed = TRUE;
+			}
+			ImGui::Separator();
+			/* Visible regions (refcount > 0 from region tool). */
+			for (i = 0; i < COUNT_OF(mod->region.colors); i++) {
+				if (mod->region.colors[i].refcount) {
+					ImVec4 c = ImGui::ColorConvertU32ToFloat4(
+						mod->region.bucket.colors[mod->region.colors[i].color_index]);
+					struct ap_map_region_template * t =
+						ap_map_get_region_template(mod->ap_map, i);
+					c.w = 1.0f;
+					snprintf(label, sizeof(label), "##RCT%u", i);
+					ImGui::ColorButton(label, c,
+						ImGuiColorEditFlags_NoTooltip);
+					if (t)
+						snprintf(label, sizeof(label), "[%03u] %s", i, t->glossary);
+					else
+						snprintf(label, sizeof(label), "[%03u] Invalid Region", i);
+					ImGui::SameLine();
+					if (ImGui::Selectable(label, mod->active_region_id == i)) {
+						mod->pending_region_id = i;
+						mod->region_changed = TRUE;
+					}
+				}
+			}
+			ImGui::Dummy(ImVec2(0.0f, 10.0f));
+			ImGui::Text("Non-visible Regions");
+			ImGui::Separator();
+			for (i = 0; i < COUNT_OF(mod->region.colors); i++) {
+				if (!mod->region.colors[i].refcount) {
+					struct ap_map_region_template * t =
+						ap_map_get_region_template(mod->ap_map, i);
+					if (!t)
+						continue;
+					snprintf(label, sizeof(label), "[%03u] %s", i, t->glossary);
+					if (ImGui::Selectable(label, mod->active_region_id == i)) {
+						mod->pending_region_id = i;
+						mod->region_changed = TRUE;
+					}
+				}
+			}
+			ImGui::EndCombo();
+		}
+		if (mod->active_region_id != UINT32_MAX && mod->cached_sector_count) {
+			ImGui::SameLine();
+			ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+			ImGui::SameLine();
+			if (ImGui::Button("Textures") && !mod->browse_region_textures)
+				mod->browse_region_textures = true;
+			if (BGFX_HANDLE_IS_VALID(mod->highlight_texture)) {
+				ImGui::SameLine();
+				ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+				ImGui::SameLine();
+				ImGui::SetNextItemWidth(0.f);
+				ImGui::ColorEdit3("##hlcolor",
+					mod->highlight_color,
+					ImGuiColorEditFlags_NoInputs |
+					ImGuiColorEditFlags_NoLabel);
+				ImGui::SameLine();
+				ImGui::SetNextItemWidth(120.f);
+				ImGui::DragFloat("Opacity",
+					&mod->highlight_opacity,
+					0.001f, 0.0f, 1.0f, "%g", 0);
+			}
+			ImGui::SameLine();
+			ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+			ImGui::SameLine();
+			if (ImGui::Button("+",
+					ImVec2(ImGui::GetFrameHeight(),
+						ImGui::GetFrameHeight())))
+				mod->show_layer_window = !mod->show_layer_window;
+			ImGui::SameLine();
+			if (ImGui::Button("Export") &&
+				mod->tex_group_count > 0)
+				mod->show_export_confirm = true;
+			if (mod->export_msg_timer > 0.f) {
+				ImGui::SameLine();
+				ImGui::TextColored(ImVec4(0.f, 1.f, 0.f, 1.f),
+					"Exported!");
+			}
+		}
+		if (mod->show_export_confirm) {
+			ImGui::OpenPopup("Export Layers?");
+			mod->show_export_confirm = false;
+		}
+		if (ImGui::BeginPopupModal("Export Layers?", NULL,
+				ImGuiWindowFlags_AlwaysAutoResize)) {
+			ImGui::Text(
+				"Export texture layers for region %u?",
+				mod->active_region_id);
+			ImGui::Separator();
+			if (ImGui::Button("Yes",
+					ImVec2(120.f, 0.f))) {
+				export_texture_groups(mod);
+				mod->export_msg_timer = 3.0f;
+				ImGui::CloseCurrentPopup();
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("No",
+					ImVec2(120.f, 0.f)))
+				ImGui::CloseCurrentPopup();
+			ImGui::EndPopup();
+		}
+		if (mod->browse_region_textures)
+			browserregiontextures(mod);
+		if (mod->show_layer_window)
+			render_layer_window(mod);
+		ImGui::PopStyleVar(1);
+		break;
+	}
 	}
 }
 
@@ -2834,5 +3774,32 @@ void ae_terrain_imgui(struct ae_terrain_module * mod)
 			memset(mod->paint.tex_name, 0, sizeof(mod->paint.tex_name));
 		}
 	}
+}
+
+boolean ae_terrain_region_changed(struct ae_terrain_module * mod)
+{
+	if (mod->region_changed) {
+		mod->region_changed = FALSE;
+		return TRUE;
+	}
+	return FALSE;
+}
+
+uint32_t ae_terrain_get_pending_region(struct ae_terrain_module * mod)
+{
+	return mod->pending_region_id;
+}
+
+void ae_terrain_confirm_region(struct ae_terrain_module * mod, uint32_t region_id)
+{
+	uint32_t i;
+	mod->active_region_id = region_id;
+	for (i = 0; i < mod->tex_group_count; i++) {
+		vec_clear(mod->tex_groups[i].textures);
+		if (mod->tex_groups[i].pending_tex_names)
+			vec_clear(mod->tex_groups[i].pending_tex_names);
+	}
+	BGFX_INVALIDATE_HANDLE(mod->highlight_texture);
+	load_region_layers(mod);
 }
 

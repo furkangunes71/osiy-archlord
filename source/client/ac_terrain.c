@@ -113,6 +113,12 @@ struct ac_terrain_module {
 	uint32_t grid_width;
 	uint32_t grid_height;
 	boolean * sector_grid;
+	boolean has_segment_mask;
+	bgfx_texture_handle_t segment_mask_tex;
+	bgfx_uniform_handle_t segment_mask_sampler;
+	bgfx_uniform_handle_t segment_mask_uniform;
+	float segment_mask_begin[2];
+	float segment_mask_length;
 	vec2 last_sync_pos;
 	struct ac_terrain_sector sectors[AP_SECTOR_WORLD_INDEX_WIDTH][AP_SECTOR_WORLD_INDEX_HEIGHT];
 	struct ap_scr_index * visible_sectors;
@@ -1326,6 +1332,18 @@ static boolean create_shaders(struct ac_terrain_module * mod)
 	CREATE_SAMPLER("s_texAlpha1", sampler[3]);
 	CREATE_SAMPLER("s_texColor1", sampler[4]);
 #undef CREATE_SAMPLER
+	mod->segment_mask_sampler = bgfx_create_uniform("s_texMask",
+		BGFX_UNIFORM_TYPE_SAMPLER, 1);
+	if (!BGFX_HANDLE_IS_VALID(mod->segment_mask_sampler)) {
+		ERROR("Failed to create segment mask sampler.");
+		return FALSE;
+	}
+	mod->segment_mask_uniform = bgfx_create_uniform("u_maskParams",
+		BGFX_UNIFORM_TYPE_VEC4, 1);
+	if (!BGFX_HANDLE_IS_VALID(mod->segment_mask_uniform)) {
+		ERROR("Failed to create segment mask uniform.");
+		return FALSE;
+	}
 	memset(null_data, 0, sizeof(null_data));
 	mem = bgfx_copy(null_data, sizeof(null_data));
 	mod->null_tex = bgfx_create_texture_2d(8, 8, false, 1,
@@ -1450,6 +1468,12 @@ static void onshutdown(struct ac_terrain_module * mod)
 	bgfx_destroy_program(mod->program_render_view[AC_TERRAIN_RENDER_VIEW_BASE]);
 	bgfx_destroy_program(mod->program_render_view[AC_TERRAIN_RENDER_VIEW_LAYER0]);
 	bgfx_destroy_program(mod->program_render_view[AC_TERRAIN_RENDER_VIEW_LAYER1]);
+	if (BGFX_HANDLE_IS_VALID(mod->segment_mask_tex))
+		bgfx_destroy_texture(mod->segment_mask_tex);
+	if (BGFX_HANDLE_IS_VALID(mod->segment_mask_sampler))
+		bgfx_destroy_uniform(mod->segment_mask_sampler);
+	if (BGFX_HANDLE_IS_VALID(mod->segment_mask_uniform))
+		bgfx_destroy_uniform(mod->segment_mask_uniform);
 	bgfx_destroy_frame_buffer(mod->rough_frame_buffer);
 	bgfx_destroy_texture(mod->rough_read_back);
 }
@@ -1491,6 +1515,10 @@ struct ac_terrain_module * ac_terrain_create_module()
 	}
 	mod->rough_read_back_frame = UINT32_MAX;
 	mod->render_view = AC_TERRAIN_RENDER_VIEW_ALL;
+	mod->has_segment_mask = FALSE;
+	mod->segment_mask_tex = (bgfx_texture_handle_t)BGFX_INVALID_HANDLE;
+	mod->segment_mask_sampler = (bgfx_uniform_handle_t)BGFX_INVALID_HANDLE;
+	mod->segment_mask_uniform = (bgfx_uniform_handle_t)BGFX_INVALID_HANDLE;
 	return mod;
 }
 
@@ -1564,8 +1592,61 @@ void ac_terrain_set_sector_grid(
 	mod->grid_min_z = min_z;
 	mod->grid_width = width;
 	mod->grid_height = height;
+	if (mod->sector_grid)
+		dealloc(mod->sector_grid);
 	mod->sector_grid = (boolean *)alloc(width * height * sizeof(boolean));
 	memcpy(mod->sector_grid, grid, width * height * sizeof(boolean));
+}
+
+void ac_terrain_clear_sector_grid(struct ac_terrain_module * mod)
+{
+	if (mod->sector_grid) {
+		dealloc(mod->sector_grid);
+		mod->sector_grid = NULL;
+	}
+	mod->has_sector_grid = FALSE;
+}
+
+void ac_terrain_set_segment_mask(
+	struct ac_terrain_module * mod,
+	const uint8_t * mask_data,
+	uint32_t width,
+	uint32_t height,
+	float begin_x,
+	float begin_z,
+	float length)
+{
+	const bgfx_memory_t * mem = bgfx_copy(mask_data,
+		width * height);
+	if (BGFX_HANDLE_IS_VALID(mod->segment_mask_tex))
+		bgfx_destroy_texture(mod->segment_mask_tex);
+	mod->segment_mask_tex = bgfx_create_texture_2d(
+		width, height, false, 1,
+		BGFX_TEXTURE_FORMAT_R8,
+		BGFX_SAMPLER_POINT |
+		BGFX_SAMPLER_U_CLAMP |
+		BGFX_SAMPLER_V_CLAMP,
+		mem);
+	if (!BGFX_HANDLE_IS_VALID(mod->segment_mask_tex)) {
+		ERROR("Failed to create segment mask texture (%ux%u).",
+			width, height);
+		return;
+	}
+	mod->has_segment_mask = TRUE;
+	mod->segment_mask_begin[0] = begin_x;
+	mod->segment_mask_begin[1] = begin_z;
+	mod->segment_mask_length = length;
+	INFO("Segment mask: %ux%u begin=[%.0f,%.0f] length=%.0f",
+		width, height, begin_x, begin_z, length);
+}
+
+void ac_terrain_clear_segment_mask(struct ac_terrain_module * mod)
+{
+	if (BGFX_HANDLE_IS_VALID(mod->segment_mask_tex)) {
+		bgfx_destroy_texture(mod->segment_mask_tex);
+		mod->segment_mask_tex = (bgfx_texture_handle_t)BGFX_INVALID_HANDLE;
+	}
+	mod->has_segment_mask = FALSE;
 }
 
 void ac_terrain_set_render_view(
@@ -1694,6 +1775,21 @@ void ac_terrain_render(struct ac_terrain_module * mod)
 							mod->null_tex, UINT32_MAX);
 					}
 				}
+				if (mod->has_segment_mask) {
+					vec4 mp = { mod->segment_mask_begin[0],
+						mod->segment_mask_begin[1],
+						mod->segment_mask_length, 1.0f };
+					bgfx_set_texture(5, mod->segment_mask_sampler,
+						mod->segment_mask_tex, UINT32_MAX);
+					bgfx_set_uniform(mod->segment_mask_uniform,
+						mp, 1);
+				} else {
+					vec4 mp = { 0.0f, 0.0f, 1.0f, 0.0f };
+					bgfx_set_texture(5, mod->segment_mask_sampler,
+						mod->null_tex, UINT32_MAX);
+					bgfx_set_uniform(mod->segment_mask_uniform,
+						mp, 1);
+				}
 				bgfx_set_state(state, 0xffffffff);
 				//bgfx_set_debug(BGFX_DEBUG_WIREFRAME);
 				bgfx_submit(view, program, 0, discard);
@@ -1705,7 +1801,8 @@ void ac_terrain_render(struct ac_terrain_module * mod)
 void ac_terrain_custom_render(
 	struct ac_terrain_module * mod,
 	ap_module_t callback_module,
-	ap_module_default_t callback)
+	ap_module_default_t callback,
+	boolean force_detail)
 {
 	int view = ac_render_get_view(mod->ac_render);
 	struct ac_camera * cam = ac_camera_get_main(mod->ac_camera);
@@ -1716,13 +1813,15 @@ void ac_terrain_custom_render(
 		struct ac_terrain_sector * sector = &mod->sectors[index->x][index->z];
 		struct ac_mesh_geometry * geometry = NULL;;
 		if (sector->flags & AC_TERRAIN_SECTOR_DETAIL_IS_LOADED) {
-			vec3 center = { sector->geometry->bsphere.center.x,
-				sector->geometry->bsphere.center.y,
-				sector->geometry->bsphere.center.z };
-			float distance = glm_vec3_distance(cam->eye, center);
 			geometry = sector->geometry;
-			if (distance > 10000.0f && (sector->flags & AC_TERRAIN_SECTOR_ROUGH_IS_LOADED))
-				geometry = sector->rough_geometry;
+			if (!force_detail) {
+				vec3 center = { sector->geometry->bsphere.center.x,
+					sector->geometry->bsphere.center.y,
+					sector->geometry->bsphere.center.z };
+				float distance = glm_vec3_distance(cam->eye, center);
+				if (distance > 10000.0f && (sector->flags & AC_TERRAIN_SECTOR_ROUGH_IS_LOADED))
+					geometry = sector->rough_geometry;
+			}
 		}
 		else if (sector->flags & AC_TERRAIN_SECTOR_ROUGH_IS_LOADED) {
 			geometry = sector->rough_geometry;
@@ -1748,8 +1847,29 @@ void ac_terrain_custom_render(
 					BGFX_STATE_DEPTH_TEST_LESS |
 					BGFX_STATE_CULL_CW;
 				cb.program = mod->program;
-				callback(callback_module, &cb);
-				//bgfx_set_debug(BGFX_DEBUG_WIREFRAME);
+				cb.material = &geometry->materials[split->material_index];
+				cb.sector = sector;
+				cb.geometry = geometry;
+				cb.split = split;
+				if (!callback(callback_module, &cb)) {
+					bgfx_discard(discard);
+					continue;
+				}
+				if (mod->has_segment_mask) {
+					vec4 mp = { mod->segment_mask_begin[0],
+						mod->segment_mask_begin[1],
+						mod->segment_mask_length, 1.0f };
+					bgfx_set_texture(5, mod->segment_mask_sampler,
+						mod->segment_mask_tex, UINT32_MAX);
+					bgfx_set_uniform(mod->segment_mask_uniform,
+						mp, 1);
+				} else {
+					vec4 mp = { 0.0f, 0.0f, 1.0f, 0.0f };
+					bgfx_set_texture(5, mod->segment_mask_sampler,
+						mod->null_tex, UINT32_MAX);
+					bgfx_set_uniform(mod->segment_mask_uniform,
+						mp, 1);
+				}
 				bgfx_set_state(cb.state, 0xffffffff);
 				bgfx_submit(view, cb.program, 0, discard);
 			}

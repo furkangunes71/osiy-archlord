@@ -69,6 +69,11 @@ struct ac_object_module {
 	uint32_t grid_width;
 	uint32_t grid_height;
 	boolean * sector_grid;
+	boolean has_segment_mask;
+	uint8_t * segment_mask_data;
+	uint32_t segment_mask_dim;
+	float segment_mask_begin[2];
+	float segment_mask_length;
 	struct ap_scr_index * visible_sectors;
 	struct ap_scr_index * visible_sectors_tmp;
 	struct ac_object_sector sectors[AP_SECTOR_WORLD_INDEX_WIDTH][AP_SECTOR_WORLD_INDEX_HEIGHT];
@@ -1244,6 +1249,10 @@ static void onshutdown(struct ac_object_module * mod)
 {
 	vec_free(mod->visible_sectors);
 	vec_free(mod->visible_sectors_tmp);
+	if (mod->sector_grid)
+		dealloc(mod->sector_grid);
+	if (mod->segment_mask_data)
+		dealloc(mod->segment_mask_data);
 }
 
 struct ac_object_module * ac_object_create_module()
@@ -1463,8 +1472,68 @@ void ac_object_set_sector_grid(
 	mod->grid_min_z = min_z;
 	mod->grid_width = width;
 	mod->grid_height = height;
+	if (mod->sector_grid)
+		dealloc(mod->sector_grid);
 	mod->sector_grid = (boolean *)alloc(width * height * sizeof(boolean));
 	memcpy(mod->sector_grid, grid, width * height * sizeof(boolean));
+}
+
+void ac_object_clear_sector_grid(struct ac_object_module * mod)
+{
+	if (mod->sector_grid) {
+		dealloc(mod->sector_grid);
+		mod->sector_grid = NULL;
+	}
+	mod->has_sector_grid = FALSE;
+}
+
+void ac_object_set_segment_mask(
+	struct ac_object_module * mod,
+	const uint8_t * mask_data,
+	uint32_t width,
+	uint32_t height,
+	float begin_x,
+	float begin_z,
+	float length)
+{
+	uint32_t dim = width > height ? width : height;
+	if (mod->segment_mask_data)
+		dealloc(mod->segment_mask_data);
+	mod->segment_mask_data = (uint8_t *)alloc(dim * dim);
+	memcpy(mod->segment_mask_data, mask_data, dim * dim);
+	mod->segment_mask_dim = dim;
+	mod->segment_mask_begin[0] = begin_x;
+	mod->segment_mask_begin[1] = begin_z;
+	mod->segment_mask_length = length;
+	mod->has_segment_mask = TRUE;
+}
+
+void ac_object_clear_segment_mask(struct ac_object_module * mod)
+{
+	if (mod->segment_mask_data) {
+		dealloc(mod->segment_mask_data);
+		mod->segment_mask_data = NULL;
+	}
+	mod->has_segment_mask = FALSE;
+}
+
+boolean ac_object_check_segment_mask(
+	struct ac_object_module * mod,
+	float x, float z)
+{
+	float mu, mv;
+	uint32_t tx, ty;
+	if (!mod->has_segment_mask)
+		return TRUE;
+	mu = (x - mod->segment_mask_begin[0]) / mod->segment_mask_length;
+	mv = (z - mod->segment_mask_begin[1]) / mod->segment_mask_length;
+	if (mu < 0.f || mv < 0.f || mu >= 1.f || mv >= 1.f)
+		return FALSE;
+	tx = (uint32_t)(mu * mod->segment_mask_dim);
+	ty = (uint32_t)(mv * mod->segment_mask_dim);
+	if (tx >= mod->segment_mask_dim || ty >= mod->segment_mask_dim)
+		return FALSE;
+	return mod->segment_mask_data[ty * mod->segment_mask_dim + tx] != 0;
 }
 
 void ac_object_sync(
@@ -1534,12 +1603,25 @@ void ac_object_render(struct ac_object_module * mod)
 			uint32_t count = vec_count(s->objects);
 			for (j = 0; j < count; j++) {
 				struct ac_object_render_data rd = { 0 };
-				rd.state = 
+				struct ap_object * obj = s->objects[j];
+				if (mod->has_segment_mask) {
+					float mu = (obj->position.x - mod->segment_mask_begin[0]) / mod->segment_mask_length;
+					float mv = (obj->position.z - mod->segment_mask_begin[1]) / mod->segment_mask_length;
+					uint32_t tx, ty;
+					if (mu < 0.f || mv < 0.f || mu >= 1.f || mv >= 1.f)
+						continue;
+					tx = (uint32_t)(mu * mod->segment_mask_dim);
+					ty = (uint32_t)(mv * mod->segment_mask_dim);
+					if (tx >= mod->segment_mask_dim || ty >= mod->segment_mask_dim ||
+						!mod->segment_mask_data[ty * mod->segment_mask_dim + tx])
+						continue;
+				}
+				rd.state =
 					BGFX_STATE_WRITE_MASK |
 					BGFX_STATE_DEPTH_TEST_LESS |
 					BGFX_STATE_CULL_CW;
 				rd.program = mod->program;
-				render_obj(mod, s->objects[j], &rd);
+				render_obj(mod, obj, &rd);
 			}
 		}
 	}

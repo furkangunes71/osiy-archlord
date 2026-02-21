@@ -27,6 +27,7 @@
 #include "client/ac_character.h"
 #include "client/ac_imgui.h"
 #include "client/ac_mesh.h"
+#include "client/ac_object.h"
 #include "client/ac_renderware.h"
 #include "client/ac_render.h"
 #include "client/ac_terrain.h"
@@ -49,6 +50,7 @@ struct ae_npc_module {
 	struct ap_event_npc_trade_module * ap_event_npc_trade;
 	struct ac_camera_module * ac_camera;
 	struct ac_character_module * ac_character;
+	struct ac_object_module * ac_object;
 	struct ac_render_module * ac_render;
 	struct ac_terrain_module * ac_terrain;
 	struct ae_editor_action_module * ae_editor_action;
@@ -888,6 +890,7 @@ static boolean onregister(
 	AP_MODULE_INSTANCE_FIND_IN_REGISTRY(registry, mod->ap_character, AP_CHARACTER_MODULE_NAME);
 	AP_MODULE_INSTANCE_FIND_IN_REGISTRY(registry, mod->ac_camera, AC_CAMERA_MODULE_NAME);
 	AP_MODULE_INSTANCE_FIND_IN_REGISTRY(registry, mod->ac_character, AC_CHARACTER_MODULE_NAME);
+	AP_MODULE_INSTANCE_FIND_IN_REGISTRY(registry, mod->ac_object, AC_OBJECT_MODULE_NAME);
 	AP_MODULE_INSTANCE_FIND_IN_REGISTRY(registry, mod->ac_render, AC_RENDER_MODULE_NAME);
 	AP_MODULE_INSTANCE_FIND_IN_REGISTRY(registry, mod->ac_terrain, AC_TERRAIN_MODULE_NAME);
 	AP_MODULE_INSTANCE_FIND_IN_REGISTRY(registry, mod->ae_editor_action, AE_EDITOR_ACTION_MODULE_NAME);
@@ -980,8 +983,12 @@ void ae_npc_render(struct ae_npc_module * mod)
 		render.state = BGFX_STATE_WRITE_MASK |
 			BGFX_STATE_DEPTH_TEST_LESS |
 			BGFX_STATE_CULL_CW;
-		if (au_distance2d(&npc->pos, &cameracenter) <= viewdistance)
-			ac_character_render(mod->ac_character, npc, &render);
+		if (au_distance2d(&npc->pos, &cameracenter) > viewdistance)
+			continue;
+		if (!ac_object_check_segment_mask(mod->ac_object,
+				npc->pos.x, npc->pos.z))
+			continue;
+		ac_character_render(mod->ac_character, npc, &render);
 	}
 	if (mod->active_npc) {
 		struct ac_character_render_data render = { 0 };

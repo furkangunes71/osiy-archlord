@@ -20,6 +20,12 @@ void ae_terrain_toolbar(struct ae_terrain_module * mod);
 
 void ae_terrain_toolbox(struct ae_terrain_module * mod);
 
+boolean ae_terrain_region_changed(struct ae_terrain_module * mod);
+
+uint32_t ae_terrain_get_pending_region(struct ae_terrain_module * mod);
+
+void ae_terrain_confirm_region(struct ae_terrain_module * mod, uint32_t region_id);
+
 void ae_terrain_imgui(struct ae_terrain_module * mod);
 
 void ae_terrain_on_mdown(

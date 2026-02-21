@@ -407,6 +407,7 @@ imgui.ini
 content/exports
 content/client
 content/server
+content/shaders
 .claude
 .exe
 editor_x64*

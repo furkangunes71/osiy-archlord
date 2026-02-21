@@ -206,6 +206,27 @@ void ac_object_set_sector_grid(
 	uint32_t height,
 	const boolean * grid);
 
+void ac_object_clear_sector_grid(struct ac_object_module * mod);
+
+void ac_object_set_segment_mask(
+	struct ac_object_module * mod,
+	const uint8_t * mask_data,
+	uint32_t width,
+	uint32_t height,
+	float begin_x,
+	float begin_z,
+	float length);
+
+void ac_object_clear_segment_mask(struct ac_object_module * mod);
+
+/**
+ * Returns TRUE if the position passes the segment mask check
+ * (or if no mask is set).
+ */
+boolean ac_object_check_segment_mask(
+	struct ac_object_module * mod,
+	float x, float z);
+
 void ac_object_sync(struct ac_object_module * mod, const vec3 pos, boolean force);
 
 void ac_object_update(struct ac_object_module * mod, float dt);

@@ -722,6 +722,8 @@ static void updatetick(uint64_t * last, float * dt)
 	*last = t;
 }
 
+static void apply_region_filter(uint32_t region_id, struct ac_camera * cam);
+
 static void render(struct ac_camera * cam, float dt)
 {
 	static bool b = true;
@@ -749,6 +751,11 @@ static void render(struct ac_camera * cam, float dt)
 	ac_imgui_begin_toolbar(g_AcImgui);
 	ae_terrain_toolbar(g_AeTerrain);
 	ac_imgui_end_toolbar(g_AcImgui);
+	if (ae_terrain_region_changed(g_AeTerrain)) {
+		uint32_t region_id = ae_terrain_get_pending_region(g_AeTerrain);
+		apply_region_filter(region_id, cam);
+		ae_terrain_confirm_region(g_AeTerrain, region_id);
+	}
 	ac_imgui_viewport(g_AcImgui);
 	ac_console_render(g_AcConsole);
 	ae_terrain_imgui(g_AeTerrain);
@@ -827,6 +834,11 @@ struct region_scan_result {
 	uint32_t grid_width;
 	uint32_t grid_height;
 	boolean * grid;
+	uint8_t * segment_mask;
+	uint32_t mask_width;
+	uint32_t mask_height;
+	float mask_begin[2];
+	float mask_length;
 };
 
 /*
@@ -991,6 +1003,63 @@ static boolean find_region_sectors(
 			remaining -= 1032;
 		}
 	}
+	/* Pass 4: build per-segment mask texture.
+	 * Texture must be SQUARE because UV mapping uses a
+	 * single length = max(extent_x, extent_z) for both axes
+	 * (same convention as ae_terrain.cpp rebuild_segment_textures). */
+	{
+		uint32_t tex_dim = (gw > gh ? gw : gh) * 16;
+		uint8_t * mask = (uint8_t *)alloc(tex_dim * tex_dim);
+		float begin_x = AP_SECTOR_WORLD_START_X +
+			smin_x * AP_SECTOR_WIDTH;
+		float begin_z = AP_SECTOR_WORLD_START_Z +
+			smin_z * AP_SECTOR_HEIGHT;
+		float end_x = AP_SECTOR_WORLD_START_X +
+			(smax_x + 1) * AP_SECTOR_WIDTH;
+		float end_z = AP_SECTOR_WORLD_START_Z +
+			(smax_z + 1) * AP_SECTOR_HEIGHT;
+		float len = end_x - begin_x;
+		float len_z = end_z - begin_z;
+		if (len_z > len)
+			len = len_z;
+		memset(mask, 0, tex_dim * tex_dim);
+		cursor = (uint32_t *)data;
+		{
+			size_t remaining = size;
+			while (remaining >= 1032) {
+				uint32_t x = *cursor++;
+				uint32_t z = *cursor++;
+				if (x >= smin_x && x <= smax_x &&
+					z >= smin_z && z <= smax_z &&
+					grid[(z - smin_z) * gw + (x - smin_x)]) {
+					uint32_t si;
+					for (si = 0; si < 256; si++) {
+						uint16_t region_id;
+						memcpy(&region_id,
+							(uint8_t *)cursor + 2, 2);
+						if ((region_id & 0x00FF) ==
+							target_region_id) {
+							uint32_t sx = si % 16;
+							uint32_t sz = si / 16;
+							uint32_t mx = (x - smin_x) * 16 + sx;
+							uint32_t mz = (z - smin_z) * 16 + sz;
+							mask[mz * tex_dim + mx] = 255;
+						}
+						cursor++;
+					}
+				} else {
+					cursor += 256;
+				}
+				remaining -= 1032;
+			}
+		}
+		result->segment_mask = mask;
+		result->mask_width = tex_dim;
+		result->mask_height = tex_dim;
+		result->mask_begin[0] = begin_x;
+		result->mask_begin[1] = begin_z;
+		result->mask_length = len;
+	}
 	dealloc(data);
 	result->centroid[0] = cx;
 	result->centroid[1] = cz;
@@ -1000,62 +1069,93 @@ static boolean find_region_sectors(
 	result->grid_height = gh;
 	result->grid = grid;
 	INFO("find_region_sectors: grid [%u,%u] size %ux%u, "
-		"%u sectors marked",
-		smin_x, smin_z, gw, gh, grid_count);
+		"%u sectors marked, mask %ux%u",
+		smin_x, smin_z, gw, gh, grid_count,
+		result->mask_width, result->mask_height);
 	return TRUE;
 }
 
-static void setspawnpos(struct ac_camera * cam)
+static void apply_region_filter(
+	uint32_t region_id,
+	struct ac_camera * cam)
 {
-	vec3 center = { -462922.5f, 3217.9f, -44894.8f };
-	const char * region_cfg = ap_config_get(g_ApConfig, "EditorStartRegion");
-	INFO("setspawnpos: EditorStartRegion=%s", region_cfg ? region_cfg : "(null)");
-	if (region_cfg) {
-		uint32_t region_id = (uint32_t)strtoul(region_cfg, NULL, 10);
+	if (region_id == UINT32_MAX) {
+		/* Clear all filters. */
+		ac_terrain_clear_sector_grid(g_AcTerrain);
+		ac_terrain_clear_segment_mask(g_AcTerrain);
+		ac_object_clear_sector_grid(g_AcObject);
+		ac_object_clear_segment_mask(g_AcObject);
+		g_RegionLock = FALSE;
+		ac_terrain_set_view_distance(g_AcTerrain,
+			AP_SECTOR_WIDTH * 4);
+		ac_object_set_view_distance(g_AcObject,
+			AP_SECTOR_WIDTH * 4);
+		ac_terrain_sync(g_AcTerrain, cam->center, TRUE);
+		ac_object_sync(g_AcObject, cam->center, TRUE);
+		return;
+	}
+	{
 		struct region_scan_result scan = { 0 };
-		INFO("setspawnpos: parsed region_id=%u", region_id);
 		if (find_region_sectors(region_id, &scan)) {
 			float vd;
 			g_RegionLock = TRUE;
-			center[0] = scan.centroid[0];
-			center[2] = scan.centroid[1];
-			/* World-coord bounds for camera clamping. */
+			cam->center[0] = scan.centroid[0];
+			cam->center[2] = scan.centroid[1];
+			cam->center_dst[0] = scan.centroid[0];
+			cam->center_dst[2] = scan.centroid[1];
 			g_RegionMin[0] = ap_scr_get_start_x(scan.grid_min_x);
 			g_RegionMin[1] = ap_scr_get_start_z(scan.grid_min_z);
 			g_RegionMax[0] = ap_scr_get_end_x(
 				scan.grid_min_x + scan.grid_width - 1);
 			g_RegionMax[1] = ap_scr_get_end_z(
 				scan.grid_min_z + scan.grid_height - 1);
-			/* Pass exact sector grid to terrain and object modules. */
 			ac_terrain_set_sector_grid(g_AcTerrain,
 				scan.grid_min_x, scan.grid_min_z,
 				scan.grid_width, scan.grid_height, scan.grid);
 			ac_object_set_sector_grid(g_AcObject,
 				scan.grid_min_x, scan.grid_min_z,
 				scan.grid_width, scan.grid_height, scan.grid);
-			/* View distance covers the full grid. */
+			ac_terrain_set_segment_mask(g_AcTerrain,
+				scan.segment_mask,
+				scan.mask_width, scan.mask_height,
+				scan.mask_begin[0], scan.mask_begin[1],
+				scan.mask_length);
+			ac_object_set_segment_mask(g_AcObject,
+				scan.segment_mask,
+				scan.mask_width, scan.mask_height,
+				scan.mask_begin[0], scan.mask_begin[1],
+				scan.mask_length);
 			vd = ((scan.grid_width > scan.grid_height ?
 				scan.grid_width : scan.grid_height) *
 				AP_SECTOR_WIDTH) * 0.5f + AP_SECTOR_WIDTH;
 			ac_terrain_set_view_distance(g_AcTerrain, vd);
-			INFO("EditorStartRegion=%u: grid [%u,%u] %ux%u "
+			ac_object_set_view_distance(g_AcObject, vd);
+			INFO("apply_region_filter: region=%u grid [%u,%u] %ux%u "
 				"view_distance=%.0f",
 				region_id, scan.grid_min_x, scan.grid_min_z,
 				scan.grid_width, scan.grid_height, vd);
+			ac_terrain_sync(g_AcTerrain, cam->center, TRUE);
+			ac_object_sync(g_AcObject, cam->center, TRUE);
 			dealloc(scan.grid);
+			dealloc(scan.segment_mask);
 		} else {
-			WARN("EditorStartRegion=%u: region not found in node_data.",
+			WARN("apply_region_filter: region %u not found in node_data.",
 				region_id);
 		}
 	}
+}
+
+static void setspawnpos(struct ac_camera * cam)
+{
+	vec3 center = { -462922.5f, 3217.9f, -44894.8f };
 	const char * pos_cfg = ap_config_get(g_ApConfig, "EditorStartPosition");
 	if (pos_cfg) {
 		vec3 c = { 0 };
 		if (sscanf(pos_cfg, "%f,%f,%f", &c[0], &c[1], &c[2]))
 			glm_vec3_copy(c, center);
 	}
-	INFO("setspawnpos: final center=[%.1f,%.1f,%.1f] region_lock=%d",
-		center[0], center[1], center[2], g_RegionLock);
+	INFO("setspawnpos: center=[%.1f,%.1f,%.1f]",
+		center[0], center[1], center[2]);
 	ac_camera_init(cam, center, 5000.0f, 45.0f, 30.0f, 60.0f, 100.0f, 400000.0f);
 	ac_terrain_sync(g_AcTerrain, cam->center, TRUE);
 	ac_object_sync(g_AcObject, cam->center, TRUE);

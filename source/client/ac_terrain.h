@@ -17,6 +17,7 @@ BEGIN_DECLS
 
 struct ac_mesh_geometry;
 struct ac_mesh_material;
+struct ac_mesh_split;
 struct ac_camera;
 
 enum ac_terrain_sector_flag_bits {
@@ -138,6 +139,10 @@ struct ac_terrain_cb_segment_modification {
 struct ac_terrain_cb_custom_render {
 	uint64_t state;
 	bgfx_program_handle_t program;
+	const struct ac_mesh_material * material;
+	const struct ac_terrain_sector * sector;
+	const struct ac_mesh_geometry * geometry;
+	const struct ac_mesh_split * split;
 };
 
 struct ac_terrain_module * ac_terrain_create_module();
@@ -175,8 +180,21 @@ void ac_terrain_set_sector_grid(
 	uint32_t height,
 	const boolean * grid);
 
+void ac_terrain_clear_sector_grid(struct ac_terrain_module * mod);
+
+void ac_terrain_set_segment_mask(
+	struct ac_terrain_module * mod,
+	const uint8_t * mask_data,
+	uint32_t width,
+	uint32_t height,
+	float begin_x,
+	float begin_z,
+	float length);
+
+void ac_terrain_clear_segment_mask(struct ac_terrain_module * mod);
+
 void ac_terrain_set_render_view(
-	struct ac_terrain_module * mod, 
+	struct ac_terrain_module * mod,
 	enum ac_terrain_render_view view);
 
 enum ac_terrain_render_view ac_terrain_get_render_view(
@@ -194,7 +212,8 @@ void ac_terrain_render(struct ac_terrain_module * mod);
 void ac_terrain_custom_render(
 	struct ac_terrain_module * mod,
 	ap_module_t callback_module,
-	ap_module_default_t callback);
+	ap_module_default_t callback,
+	boolean force_detail);
 
 void ac_terrain_render_rough_textures(struct ac_terrain_module * mod);
 

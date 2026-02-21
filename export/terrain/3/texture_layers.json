@@ -1,0 +1,39 @@
+{
+    "groups": [
+        {
+            "name": "Cim",
+            "textures": [
+                "a091300t",
+                "a090200t",
+                "a090100t",
+                "a091200t",
+                "a092100t"
+            ]
+        },
+        {
+            "name": "Daglik",
+            "textures": [
+                "a090800t",
+                "a092a00t",
+                "a110200t",
+                "a090d00t",
+                "a090300t",
+                "a090500t"
+            ]
+        },
+        {
+            "name": "Parke",
+            "textures": [
+                "a1f0500t"
+            ]
+        },
+        {
+            "name": "Toprak",
+            "textures": [
+                "a092300t",
+                "a0b0700t",
+                "a091000t"
+            ]
+        }
+    ]
+}
