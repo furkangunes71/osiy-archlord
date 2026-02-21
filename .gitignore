@@ -405,3 +405,8 @@ imgui.ini
 
 # Exports
 content/exports
+content/client
+content/server
+.claude
+.exe
+editor_x64*

@@ -27,7 +27,7 @@ BEGIN_DECLS
 struct bin_stream;
 
 enum ap_octree_data_index {
-	AP_OCTREE_NODE_DATA,
+	
 	AP_OCTREE_ROOT_DATA
 };
 

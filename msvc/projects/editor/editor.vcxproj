@@ -63,12 +63,12 @@
     <TargetName>$(ProjectName)_$(Platform)_$(Configuration)</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='DebugRender|x64'">
-    <OutDir>$(SolutionDir)\..\bin\</OutDir>
+    <OutDir>$(SolutionDir)\..</OutDir>
     <IntDir>$(ProjectDir)\build\$(Platform)\$(Configuration)\</IntDir>
     <TargetName>$(ProjectName)_$(Platform)_$(Configuration)</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <OutDir>$(SolutionDir)\..\bin\</OutDir>
+    <OutDir>$(SolutionDir)\..</OutDir>
     <IntDir>$(ProjectDir)\build\$(Platform)\$(Configuration)\</IntDir>
     <TargetName>$(ProjectName)_$(Platform)_$(Configuration)</TargetName>
   </PropertyGroup>
@@ -252,8 +252,6 @@
     <ClInclude Include="..\..\..\source\utility\au_table.h" />
     <ClInclude Include="..\..\..\source\vendor\aplib\aplib.h" />
     <ClInclude Include="..\..\..\source\vendor\bgfx\c99\bgfx.h" />
-    <ClInclude Include="..\..\..\source\vendor\cgltf\cgltf.h" />
-    <ClInclude Include="..\..\..\source\vendor\cgltf\cgltf_write.h" />
     <ClInclude Include="..\..\..\source\vendor\imgui\imconfig.h" />
     <ClInclude Include="..\..\..\source\vendor\imgui\imgui.h" />
     <ClInclude Include="..\..\..\source\vendor\imgui\imgui_internal.h" />
@@ -263,7 +261,6 @@
     <ClInclude Include="..\..\..\source\vendor\nvtt\nvtt.h" />
     <ClInclude Include="..\..\..\source\vendor\nvtt\nvtt_lowlevel.h" />
     <ClInclude Include="..\..\..\source\vendor\nvtt\nvtt_wrapper.h" />
-    <ClInclude Include="..\..\..\source\vendor\parson\parson.h" />
     <ClInclude Include="..\..\..\source\vendor\pcg\pcg_basic.h" />
   </ItemGroup>
   <ItemGroup>
@@ -383,7 +380,6 @@
     <ClCompile Include="..\..\..\source\vendor\imgui\imgui_draw.cpp" />
     <ClCompile Include="..\..\..\source\vendor\imgui\imgui_tables.cpp" />
     <ClCompile Include="..\..\..\source\vendor\imgui\imgui_widgets.cpp" />
-    <ClCompile Include="..\..\..\source\vendor\parson\parson.c" />
     <ClCompile Include="..\..\..\source\vendor\pcg\pcg_basic.c" />
   </ItemGroup>
   <ItemGroup>

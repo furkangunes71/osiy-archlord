@@ -131,8 +131,6 @@ boolean replace_file(
 	const char * replaced, 
 	const char * replacement);
 
-boolean remove_file(const char * path);
-
 END_DECLS
 
 #endif /* _CORE_FILE_SYSTEM_H_ */

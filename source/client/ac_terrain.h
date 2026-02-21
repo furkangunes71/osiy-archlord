@@ -274,19 +274,6 @@ void ac_terrain_set_tile_info(
 
 void ac_terrain_commit_changes(struct ac_terrain_module * mod);
 
-uint32_t ac_terrain_get_visible_sectors(
-	struct ac_terrain_module * mod, 
-	struct ac_terrain_sector ** list, 
-	uint32_t max_count);
-
-/** Returns a vector of geometry if division exists.
- *  Returns NULL otherwise.
- */
-struct ac_mesh_geometry ** ac_terrain_batch_load_detail(
-	struct ac_terrain_module * mod, 
-	uint32_t division_x,
-	uint32_t division_z);
-
 END_DECLS
 
 #endif /* _AC_TERRAIN_H_ */

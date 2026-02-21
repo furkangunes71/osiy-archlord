@@ -35,8 +35,6 @@
 #include "editor/ae_transform_tool.h"
 
 #include <ctype.h>
-#include <unordered_map>
-#include <vector>
 
 #define MAX_EDIT_TEMPLATE_COUNT 32
 
@@ -70,10 +68,7 @@ struct ae_object_module {
 	uint32_t templates_in_edit_count;
 	char template_editor_search_input[128];
 	boolean has_pending_template_changes;
-	uint32_t * exported_object_tids;
 };
-
-void process_export_queue(ae_object_module * mod);
 
 static struct ap_object * pick_object(
 	struct ae_object_module * mod,
@@ -183,14 +178,8 @@ static boolean cbcommitchanges(
 			struct ac_object_sector * s = 
 				ac_object_get_sector_by_index(mod->ac_object, x, z);
 			if (s->flags & AC_OBJECT_SECTOR_HAS_CHANGES) {
-				char srv[1024];
-				char cli[1024];
-				uint32_t div = (x / AP_SECTOR_DEFAULT_DEPTH) * 100 + (z / AP_SECTOR_DEFAULT_DEPTH);
 				ac_object_export_sector(mod->ac_object, s, serverpath);
-				if (make_path(srv, sizeof(srv), "%s/obj%05u.ini", serverpath, div) &&
-					make_path(cli, sizeof(cli), "%s/obj%05u.ini", clientpath, div)) {
-					copy_file(srv, cli, FALSE);
-				}
+				copy_file(serverpath, clientpath, FALSE);
 				s->flags &= ~AC_OBJECT_SECTOR_HAS_CHANGES;
 			}
 		}
@@ -568,10 +557,6 @@ static boolean oninitialize(struct ae_object_module * mod)
 static void onshutdown(struct ae_object_module * mod)
 {
 	vec_free(mod->objects);
-	if (mod->exported_object_tids) {
-		vec_free(mod->exported_object_tids);
-		mod->exported_object_tids = NULL;
-	}
 	if (BGFX_HANDLE_IS_VALID(mod->program))
 		bgfx_destroy_program(mod->program);
 }
@@ -591,7 +576,6 @@ struct ae_object_module * ae_object_create_module()
 
 void ae_object_update(struct ae_object_module * mod, float dt)
 {
-	process_export_queue(mod);
 }
 
 void ae_object_render_outline(struct ae_object_module * mod, struct ac_camera * cam)
@@ -746,289 +730,4 @@ void ae_object_imgui(struct ae_object_module * mod)
 {
 	rendertemplateselectionwindow(mod);
 	renderaddobjectpopup(mod);
-}
-
-static void add_object_geometry_to_json(
-	struct ae_object_module * mod, 
-	JSON_Object * json, 
-	struct ap_object * obj, 
-	uint32_t id,
-	struct ac_object_template * temp,
-	struct ac_mesh_geometry * g)
-{
-	uint32_t splitid = 0;
-	for (uint32_t j = 0; j < g->split_count; j++) {
-		const struct ac_mesh_split * split = &g->splits[j];
-		char name[128];
-		std::vector<uint32_t> vertices;
-		std::unordered_map<uint32_t, uint32_t> vertexmap;
-		uint32_t matindex = -1;
-		const struct ac_mesh_material * mat = &g->materials[split->material_index];
-		char splitpath[1024];
-		char proppath[1024];
-		JSON_Value * arrayvalue;
-		JSON_Array * arr;
-		snprintf(splitpath, sizeof(splitpath), "object_splits.%u_%u", 
-			obj ? obj->object_id : id, splitid++);
-		for (uint32_t k = 0; k < split->index_count; k++) {
-			uint32_t idx;
-			boolean add = TRUE;
-			uint32_t vertexidx = g->indices[split->index_offset + k];
-			for (idx = 0; idx < vertices.size(); idx++) {
-				if (vertices[idx] == vertexidx) {
-					break;
-				}
-			}
-			if (std::find(vertices.begin(), vertices.end(), vertexidx) == vertices.end()) {
-				vertexmap[vertexidx] = (uint32_t)vertices.size();
-				vertices.push_back(vertexidx);
-			}
-		}
-		arrayvalue = json_value_init_array();
-		arr = json_value_get_array(arrayvalue);
-		for (size_t k = 0; k < vertices.size(); k++) {
-			const struct ac_mesh_vertex * v = &g->vertices[vertices[k]];
-			JSON_Value * val = json_value_init_array();
-			JSON_Array * a = json_value_get_array(val);
-			json_array_append_number(a, v->position[0]);
-			json_array_append_number(a, v->position[1]);
-			json_array_append_number(a, v->position[2]);
-			json_array_append_value(arr, val);
-		}
-		snprintf(proppath, sizeof(proppath), "%s.vertices", splitpath);
-		json_object_dotset_value(json, proppath, arrayvalue);
-		arrayvalue = json_value_init_array();
-		arr = json_value_get_array(arrayvalue);
-		for (size_t k = 0; k < vertices.size(); k++) {
-			const struct ac_mesh_vertex * v = &g->vertices[vertices[k]];
-			JSON_Value * val = json_value_init_array();
-			JSON_Array * a = json_value_get_array(val);
-			json_array_append_number(a, v->normal[0]);
-			json_array_append_number(a, v->normal[1]);
-			json_array_append_number(a, v->normal[2]);
-			json_array_append_value(arr, val);
-		}
-		snprintf(proppath, sizeof(proppath), "%s.normals", splitpath);
-		json_object_dotset_value(json, proppath, arrayvalue);
-		arrayvalue = json_value_init_array();
-		arr = json_value_get_array(arrayvalue);
-		for (uint32_t k = 0; k < COUNT_OF(mat->tex_name); k++) {
-			if (!strisempty(mat->tex_name[k])) {
-				snprintf(name, sizeof(name), "%s.png", mat->tex_name[k]);
-				json_array_append_string(arr, name);
-			}
-			else {
-				json_array_append_string(arr, "");
-			}
-		}
-		snprintf(proppath, sizeof(proppath), "%s.textures", splitpath);
-		json_object_dotset_value(json, proppath, arrayvalue);
-		for (uint32_t uv = 0; uv < 5; uv++) {
-			const char * uvnames[]= { "uvbase", "uvalpha1", "uvcolor1",
-				"uvalpha2", "uvcolor2" };
-			arrayvalue = json_value_init_array();
-			arr = json_value_get_array(arrayvalue);
-			for (uint32_t k = 0; k < vertices.size(); k++) {
-				const struct ac_mesh_vertex * v = &g->vertices[vertices[k]];
-				JSON_Value * val = json_value_init_array();
-				JSON_Array * a = json_value_get_array(val);
-				json_array_append_number(a, v->texcoord[uv][0]);
-				json_array_append_number(a, v->texcoord[uv][1]);
-				json_array_append_value(arr, val);
-			}
-			snprintf(proppath, sizeof(proppath), "%s.%s", splitpath, uvnames[uv]);
-			json_object_dotset_value(json, proppath, arrayvalue);
-		}
-		arrayvalue = json_value_init_array();
-		arr = json_value_get_array(arrayvalue);
-		for (uint32_t k = 0; k < split->index_count / 3; k++) {
-			JSON_Value * val = json_value_init_array();
-			JSON_Array * a = json_value_get_array(val);
-			for (uint32_t l = 0; l < 3; l++) {
-				uint32_t vertexidx = g->indices[split->index_offset + k * 3 + l];
-				uint32_t mapped = vertexmap[vertexidx];
-				json_array_append_number(a, mapped);
-			}
-			json_array_append_value(arr, val);
-		}
-		snprintf(proppath, sizeof(proppath), "%s.faces", splitpath);
-		json_object_dotset_value(json, proppath, arrayvalue);
-		arrayvalue = json_value_init_array();
-		arr = json_value_get_array(arrayvalue);
-		if (obj) {
-			json_array_append_number(arr, obj->position.x);
-			json_array_append_number(arr, obj->position.y);
-			json_array_append_number(arr, obj->position.z);
-		}
-		else {
-			json_array_append_number(arr, 0.0f);
-			json_array_append_number(arr, 0.0f);
-			json_array_append_number(arr, 0.0f);
-		}
-		snprintf(proppath, sizeof(proppath), "%s.position", splitpath);
-		json_object_dotset_value(json, proppath, arrayvalue);
-		snprintf(proppath, sizeof(proppath), "%s.faces", splitpath);
-		json_object_dotset_value(json, proppath, arrayvalue);
-		arrayvalue = json_value_init_array();
-		arr = json_value_get_array(arrayvalue);
-		if (obj) {
-			json_array_append_number(arr, obj->scale.x);
-			json_array_append_number(arr, obj->scale.y);
-			json_array_append_number(arr, obj->scale.z);
-		}
-		else {
-			json_array_append_number(arr, 1.0f);
-			json_array_append_number(arr, 1.0f);
-			json_array_append_number(arr, 1.0f);
-		}
-		snprintf(proppath, sizeof(proppath), "%s.scale", splitpath);
-		json_object_dotset_value(json, proppath, arrayvalue);
-		arrayvalue = json_value_init_array();
-		arr = json_value_get_array(arrayvalue);
-		if (obj) {
-			json_array_append_number(arr, obj->rotation_x);
-			json_array_append_number(arr, obj->rotation_y);
-		}
-		else {
-			json_array_append_number(arr, 0.0f);
-			json_array_append_number(arr, 0.0f);
-		}
-		snprintf(proppath, sizeof(proppath), "%s.rotation", splitpath);
-		json_object_dotset_value(json, proppath, arrayvalue);
-		snprintf(proppath, sizeof(proppath), "%s.alphablend", splitpath);
-		json_object_dotset_boolean(json, proppath, 
-			(temp->object_type & AC_OBJECT_TYPE_USE_ALPHA) != 0 ||
-			(temp->object_type & AC_OBJECT_TYPE_USE_ALPHAFUNC) != 0 ||
-			(temp->object_type & AC_OBJECT_TYPE_RENDER_UDA) != 0);
-		snprintf(proppath, sizeof(proppath), "%s.showback", splitpath);
-		json_object_dotset_boolean(json, proppath, 
-			(temp->object_type & AC_OBJECT_TYPE_RENDER_UDA) != 0);
-	}
-}
-
-static void add_object_template_to_json(
-	struct ae_object_module * mod, 
-	JSON_Object * json, 
-	uint32_t tid,
-	struct ac_object_template * temp)
-{
-	struct ac_object_template_group * grp;
-	grp = temp->group_list;
-	while (grp) {
-		if (grp->clump) {
-			struct ac_mesh_geometry * g = grp->clump->glist;
-			while (g) {
-				add_object_geometry_to_json(mod, json, NULL, tid, temp, g);
-				g = g->next;
-			}
-		}
-		grp = grp->next;
-	}
-}
-
-static void add_object_to_json(
-	struct ae_object_module * mod, 
-	JSON_Object * json, 
-	struct ap_object * obj)
-{
-	struct ac_object * o = ac_object_get_object(mod->ac_object, obj);
-	struct ac_object_template * temp = ac_object_get_template(obj->temp);
-	struct ac_object_template_group * grp;
-	grp = temp->group_list;
-	while (grp) {
-		if (grp->clump) {
-			struct ac_mesh_geometry * g = grp->clump->glist;
-			while (g) {
-				add_object_geometry_to_json(mod, json, obj, -1, temp, g);
-				g = g->next;
-			}
-		}
-		grp = grp->next;
-	}
-}
-
-void ae_object_export_scene(struct ae_object_module * mod, JSON_Object * json)
-{
-	struct ap_object ** list = 
-		(struct ap_object **)vec_new_reserved(sizeof(*list), 128);
-	ac_object_query_visible_objects(mod->ac_object, &list);
-	uint32_t count = vec_count(list);
-	for (uint32_t i = 0; i < count; i++) {
-		add_object_to_json(mod, json, list[i]);
-	}
-	vec_free(list);
-}
-
-void ae_object_export_active(struct ae_object_module * mod)
-{
-	char path[512];
-	if (!mod->active_object) {
-		return;
-	}
-	make_path(path, sizeof(path), "content/exports/Object%u.json", 
-		mod->active_object->object_id);
-	file f = open_file(path, FILE_ACCESS_WRITE);
-	if (!f) {
-		ERROR("Failed to create file (%s).", path);
-		return;
-	}
-	JSON_Value * root_value = json_value_init_object();
-	JSON_Object * root_obj = json_value_get_object(root_value);
-	add_object_to_json(mod, root_obj, mod->active_object);
-	char * serialized_str = json_serialize_to_string_pretty(root_value);
-	write_file(f, serialized_str, strlen(serialized_str));
-	close_file(f);
-	json_free_serialized_string(serialized_str);
-	json_value_free(root_value);
-}
-
-void ae_object_export_all(ae_object_module * mod)
-{
-	if (!mod->exported_object_tids) {
-		mod->exported_object_tids = (uint32_t *)vec_new_reserved(sizeof(*mod->exported_object_tids), 1024);
-	}
-}
-
-void process_export_queue(ae_object_module * mod)
-{
-	size_t index = 0;
-	struct ap_object_template * temp = NULL;
-	if (!mod->exported_object_tids) {
-		return;
-	}
-	while (temp = ap_object_iterate_templates(mod->ap_object, &index)) {
-		bool already_exported = false;
-		for (uint32_t i = 0; i < vec_count(mod->exported_object_tids); i++) {
-			if (mod->exported_object_tids[i] == temp->tid) {
-				already_exported = true;
-				break;
-			}
-		}
-		if (already_exported) {
-			continue;
-		}
-		vec_push_back((void **)&mod->exported_object_tids, &temp->tid);
-		struct ac_object_template * attachment = ac_object_get_template(temp);
-		char path[512];
-		ac_object_reference_template(mod->ac_object, attachment);
-		make_path(path, sizeof(path), "content/exports/ObjectTemplate_%u.json", temp->tid);
-		file f = open_file(path, FILE_ACCESS_WRITE);
-		if (!f) {
-			ERROR("Failed to create file (%s).", path);
-			ac_object_release_template(mod->ac_object, attachment);
-			return;
-		}
-		JSON_Value * root_value = json_value_init_object();
-		JSON_Object * root_obj = json_value_get_object(root_value);
-		add_object_template_to_json(mod, root_obj, temp->tid, attachment);
-		ac_object_release_template(mod->ac_object, attachment);
-		char * serialized_str = json_serialize_to_string_pretty(root_value);
-		write_file(f, serialized_str, strlen(serialized_str));
-		close_file(f);
-		json_free_serialized_string(serialized_str);
-		json_value_free(root_value);
-		return;
-	}
-	vec_free(mod->exported_object_tids);
-	mod->exported_object_tids = NULL;
 }
