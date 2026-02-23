@@ -34,6 +34,30 @@
                 "a0b0700t",
                 "a091000t"
             ]
+        },
+        {
+            "name": "Patika",
+            "textures": [
+                "a092200t"
+            ]
+        },
+        {
+            "name": "KoyPatika",
+            "textures": [
+                "a090900t"
+            ]
+        },
+        {
+            "name": "Yapi1",
+            "textures": [
+                "a260300t"
+            ]
+        },
+        {
+            "name": "Yapi2",
+            "textures": [
+                "a260200t"
+            ]
         }
     ]
 }

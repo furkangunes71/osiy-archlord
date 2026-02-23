@@ -408,6 +408,7 @@ content/exports
 content/client
 content/server
 content/shaders
+export/
 .claude
 .exe
 editor_x64*

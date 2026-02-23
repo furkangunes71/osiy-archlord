@@ -3801,5 +3801,11 @@ void ae_terrain_confirm_region(struct ae_terrain_module * mod, uint32_t region_i
 	}
 	BGFX_INVALIDATE_HANDLE(mod->highlight_texture);
 	load_region_layers(mod);
+	/* Resolve pending textures immediately using cached sectors.
+	 * This handles the case where all sectors for the new region
+	 * are already loaded and cb_post_load_sector won't fire.
+	 * Any unresolved names will be resolved when the callback
+	 * fires after new sectors finish loading. */
+	resolve_pending_textures(mod);
 }
 
