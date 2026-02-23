@@ -1,5 +1,7 @@
 ServerIniDir=content/server/ini
 ServerNodePath=content/server/world/node_data
-ClientDir=content/client
+ClientDir=client
 
-EditorStartPosition=-386803.69,6888.24,98187.72
+EditorStartPosition=75917.43,7521.41,-414110.09
+ViewDistance=4
+ShowFps=1

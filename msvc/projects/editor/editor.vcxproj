@@ -176,6 +176,9 @@
     <ClInclude Include="..\..\..\source\editor\ae_transform_tool.h" />
     <ClInclude Include="..\..\..\source\editor\ae_npc.h" />
     <ClInclude Include="..\..\..\source\editor\ae_object.h" />
+    <ClInclude Include="..\..\..\source\editor\ae_object_browser.h" />
+    <ClInclude Include="..\..\..\source\editor\ae_grass_edit.h" />
+    <ClInclude Include="..\..\..\source\editor\ae_octree.h" />
     <ClInclude Include="..\..\..\source\editor\ae_terrain.h" />
     <ClInclude Include="..\..\..\source\editor\ae_texture.h" />
     <ClInclude Include="..\..\..\source\public\ap_admin.h" />
@@ -304,6 +307,9 @@
     <ClCompile Include="..\..\..\source\editor\ae_transform_tool.cpp" />
     <ClCompile Include="..\..\..\source\editor\ae_npc.cpp" />
     <ClCompile Include="..\..\..\source\editor\ae_object.cpp" />
+    <ClCompile Include="..\..\..\source\editor\ae_object_browser.cpp" />
+    <ClCompile Include="..\..\..\source\editor\ae_grass_edit.cpp" />
+    <ClCompile Include="..\..\..\source\editor\ae_octree.cpp" />
     <ClCompile Include="..\..\..\source\editor\ae_terrain.cpp" />
     <ClCompile Include="..\..\..\source\editor\ae_texture.cpp" />
     <ClCompile Include="..\..\..\source\editor\main.cpp" />

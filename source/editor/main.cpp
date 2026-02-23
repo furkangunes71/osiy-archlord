@@ -8,6 +8,8 @@
 #define WIN32_EXTRA_LEAN
 #define NOGDI
 #include <Windows.h>
+#include <Psapi.h>
+#pragma comment(lib, "psapi.lib")
 #endif
 #undef near
 #undef far
@@ -95,10 +97,13 @@
 #include "editor/ae_event_binding.h"
 #include "editor/ae_event_refinery.h"
 #include "editor/ae_event_teleport.h"
+#include "editor/ae_grass_edit.h"
 #include "editor/ae_item.h"
 #include "editor/ae_map.h"
 #include "editor/ae_npc.h"
 #include "editor/ae_object.h"
+#include "editor/ae_object_browser.h"
+#include "editor/ae_octree.h"
 #include "editor/ae_terrain.h"
 #include "editor/ae_texture.h"
 #include "editor/ae_transform_tool.h"
@@ -110,9 +115,98 @@ struct camera_controls {
 	boolean key_state[512];
 };
 
-static boolean g_RegionLock = FALSE;
-static float g_RegionMin[2] = { 0 };
-static float g_RegionMax[2] = { 0 };
+static bool g_ShowFps = false;
+static int g_ViewDistMultiplier = 6;
+
+static void save_config_value(const char * key, const char * value)
+{
+	FILE * f;
+	char lines[32][1024];
+	int line_count = 0;
+	boolean found = FALSE;
+	size_t key_len = strlen(key);
+	f = fopen("./config", "r");
+	if (f) {
+		while (line_count < 32 &&
+				fgets(lines[line_count], sizeof(lines[0]), f)) {
+			char * nl = strchr(lines[line_count], '\n');
+			if (nl)
+				*nl = '\0';
+			nl = strchr(lines[line_count], '\r');
+			if (nl)
+				*nl = '\0';
+			if (strncmp(lines[line_count], key, key_len) == 0 &&
+					lines[line_count][key_len] == '=') {
+				snprintf(lines[line_count],
+					sizeof(lines[0]), "%s=%s", key, value);
+				found = TRUE;
+			}
+			line_count++;
+		}
+		fclose(f);
+	}
+	if (!found && line_count < 32) {
+		snprintf(lines[line_count], sizeof(lines[0]),
+			"%s=%s", key, value);
+		line_count++;
+	}
+	f = fopen("./config", "w");
+	if (f) {
+		int i;
+		for (i = 0; i < line_count; i++)
+			fprintf(f, "%s\n", lines[i]);
+		fclose(f);
+	}
+}
+
+static float g_StatsTimer = 0.0f;
+static char g_StatsBuf[256] = "";
+static float g_StatsBufWidth = 0.0f;
+#ifdef _WIN32
+static float g_CpuUsage = 0.0f;
+static ULARGE_INTEGER g_LastCpuKernel = { 0 };
+static ULARGE_INTEGER g_LastCpuUser = { 0 };
+static ULARGE_INTEGER g_LastSysTime = { 0 };
+/* NVML dynamic loading for accurate GPU utilization */
+typedef int (*nvmlInit_v2_fn)(void);
+typedef int (*nvmlDeviceGetHandleByIndex_v2_fn)(
+	unsigned int index, void ** device);
+typedef struct { unsigned int gpu; unsigned int memory; } nvmlUtilization_t;
+typedef int (*nvmlDeviceGetUtilizationRates_fn)(
+	void * device, nvmlUtilization_t * utilization);
+static HMODULE g_NvmlLib = NULL;
+static void * g_NvmlDevice = NULL;
+static nvmlDeviceGetUtilizationRates_fn g_NvmlGetUtil = NULL;
+static float g_GpuUsage = 0.0f;
+static void init_nvml(void)
+{
+	nvmlInit_v2_fn init_fn;
+	nvmlDeviceGetHandleByIndex_v2_fn getdev_fn;
+	g_NvmlLib = LoadLibraryA("nvml.dll");
+	if (!g_NvmlLib)
+		return;
+	init_fn = (nvmlInit_v2_fn)GetProcAddress(
+		g_NvmlLib, "nvmlInit_v2");
+	getdev_fn = (nvmlDeviceGetHandleByIndex_v2_fn)GetProcAddress(
+		g_NvmlLib, "nvmlDeviceGetHandleByIndex_v2");
+	g_NvmlGetUtil = (nvmlDeviceGetUtilizationRates_fn)GetProcAddress(
+		g_NvmlLib, "nvmlDeviceGetUtilizationRates");
+	if (!init_fn || !getdev_fn || !g_NvmlGetUtil) {
+		FreeLibrary(g_NvmlLib);
+		g_NvmlLib = NULL;
+		g_NvmlGetUtil = NULL;
+		return;
+	}
+	if (init_fn() != 0) {
+		FreeLibrary(g_NvmlLib);
+		g_NvmlLib = NULL;
+		g_NvmlGetUtil = NULL;
+		return;
+	}
+	if (getdev_fn(0, &g_NvmlDevice) != 0)
+		g_NvmlDevice = NULL;
+}
+#endif
 
 typedef ap_module_t (*create_module_t)();
 
@@ -196,10 +290,13 @@ static struct ae_event_auction_module * g_AeEventAuction;
 static struct ae_event_binding_module * g_AeEventBinding;
 static struct ae_event_refinery_module * g_AeEventRefinery;
 static struct ae_event_teleport_module * g_AeEventTeleport;
+static struct ae_grass_edit_module * g_AeGrass;
 static struct ae_item_module * g_AeItem;
 static struct ae_map_module * g_AeMap;
 static struct ae_npc_module * g_AeNpc;
 static struct ae_object_module * g_AeObject;
+static struct ae_object_browser_module * g_AeObjectBrowser;
+static struct ae_octree_module * g_AeOctree;
 static struct ae_terrain_module * g_AeTerrain;
 static struct ae_texture_module * g_AeTexture;
 static struct ae_transform_tool_module * g_AeTransformTool;
@@ -283,6 +380,9 @@ static struct module_desc g_Modules[] = {
 	{ AE_EVENT_REFINERY_MODULE_NAME, ae_event_refinery_create_module, NULL, &g_AeEventRefinery },
 	{ AE_EVENT_TELEPORT_MODULE_NAME, ae_event_teleport_create_module, NULL, &g_AeEventTeleport },
 	{ AE_OBJECT_MODULE_NAME, ae_object_create_module, NULL, &g_AeObject },
+	{ AE_OBJECT_BROWSER_MODULE_NAME, ae_object_browser_create_module, NULL, &g_AeObjectBrowser },
+	{ AE_OCTREE_MODULE_NAME, ae_octree_create_module, NULL, &g_AeOctree },
+	{ AE_GRASS_EDIT_MODULE_NAME, ae_grass_edit_create_module, NULL, &g_AeGrass },
 	{ AE_ITEM_MODULE_NAME, ae_item_create_module, NULL, &g_AeItem },
 	{ AE_NPC_MODULE_NAME, ae_npc_create_module, NULL, &g_AeNpc },
 };
@@ -644,8 +744,8 @@ static boolean initialize()
 		return FALSE;
 	}
 	if (!ac_character_read_templates(g_AcCharacter, path, TRUE)) {
-		ERROR("Failed to read character client templates (%s).", path);
-		return FALSE;
+		WARN("Failed to read character client templates (%s), "
+			"character visuals may be unavailable.", path);
 	}
 	if (!make_path(path, sizeof(path), "%s/npc.ini", inidir)) {
 		ERROR("Failed to create path (npc.ini).");
@@ -722,8 +822,6 @@ static void updatetick(uint64_t * last, float * dt)
 	*last = t;
 }
 
-static void apply_region_filter(uint32_t region_id, struct ac_camera * cam);
-
 static void render(struct ac_camera * cam, float dt)
 {
 	static bool b = true;
@@ -734,6 +832,9 @@ static void render(struct ac_camera * cam, float dt)
 	ae_terrain_render(g_AeTerrain, cam);
 	ac_object_render(g_AcObject);
 	ae_object_render_outline(g_AeObject, cam);
+	ae_octree_render(g_AeOctree, cam);
+	ae_grass_edit_render(g_AeGrass, cam);
+	ae_object_browser_render(g_AeObjectBrowser);
 	ae_npc_render(g_AeNpc);
 	ac_imgui_new_frame(g_AcImgui);
 	ImGui::BeginMainMenuBar();
@@ -744,27 +845,163 @@ static void render(struct ac_camera * cam, float dt)
 	}
 	if (ImGui::BeginMenu("View", true)) {
 		ae_editor_action_render_view_menu(g_AeEditorAction);
+		ImGui::Separator();
+		if (ImGui::Selectable("FPS Counter", &g_ShowFps))
+			save_config_value("ShowFps",
+				g_ShowFps ? "1" : "0");
+		ImGui::Separator();
+		ImGui::Text("View Distance");
+		{
+			int vd_options[] = { 4, 6, 8, 10 };
+			uint32_t vi;
+			for (vi = 0; vi < 4; vi++) {
+				char vd_label[32];
+				snprintf(vd_label, sizeof(vd_label), "x%d",
+					vd_options[vi]);
+				if (ImGui::RadioButton(vd_label,
+						g_ViewDistMultiplier ==
+							vd_options[vi])) {
+					g_ViewDistMultiplier = vd_options[vi];
+					{
+						char vd_buf[8];
+						snprintf(vd_buf, sizeof(vd_buf),
+							"%d", g_ViewDistMultiplier);
+						save_config_value("ViewDistance",
+							vd_buf);
+					}
+					{
+						float vd = AP_SECTOR_WIDTH *
+							(float)g_ViewDistMultiplier;
+						ac_terrain_set_view_distance(
+							g_AcTerrain, vd);
+						ac_object_set_view_distance(
+							g_AcObject, vd);
+						ac_terrain_sync(g_AcTerrain,
+							cam->center, TRUE);
+						ac_object_sync(g_AcObject,
+							cam->center, TRUE);
+						ae_grass_edit_sync(g_AeGrass,
+							cam->center, TRUE);
+					}
+				}
+				if (vi < 3)
+					ImGui::SameLine();
+			}
+		}
 		ImGui::EndMenu();
 	}
 	ac_console_render_icon(g_AcConsole);
 	ImGui::EndMainMenuBar();
 	ac_imgui_begin_toolbar(g_AcImgui);
-	ae_terrain_toolbar(g_AeTerrain);
-	ac_imgui_end_toolbar(g_AcImgui);
-	if (ae_terrain_region_changed(g_AeTerrain)) {
-		uint32_t region_id = ae_terrain_get_pending_region(g_AeTerrain);
-		apply_region_filter(region_id, cam);
-		ae_terrain_confirm_region(g_AeTerrain, region_id);
+	if (ae_object_browser_is_active(g_AeObjectBrowser))
+		ae_object_browser_toolbar(g_AeObjectBrowser);
+	else if (ae_grass_edit_is_active(g_AeGrass))
+		ae_grass_edit_toolbar(g_AeGrass);
+	else if (ae_octree_is_active(g_AeOctree))
+		ae_octree_toolbar(g_AeOctree);
+	else
+		ae_terrain_toolbar(g_AeTerrain);
+	if (g_ShowFps) {
+		g_StatsTimer += dt;
+		if (g_StatsTimer >= 0.5f || g_StatsBuf[0] == '\0') {
+			const bgfx_stats_t * stats = bgfx_get_stats();
+			float fps = (dt > 0.0001f) ? (1.0f / dt) : 0.0f;
+			int64_t ram_mb = 0;
+			int64_t ram_total = 0;
+			int64_t vram_mb = 0;
+			int64_t vram_max = 0;
+			g_StatsTimer = 0.0f;
+			vram_mb = stats->gpuMemoryUsed / (1024 * 1024);
+			vram_max = stats->gpuMemoryMax / (1024 * 1024);
+#ifdef _WIN32
+			{
+				PROCESS_MEMORY_COUNTERS pmc;
+				if (GetProcessMemoryInfo(GetCurrentProcess(),
+						&pmc, sizeof(pmc)))
+					ram_mb = (int64_t)(pmc.WorkingSetSize /
+						(1024 * 1024));
+			}
+			{
+				MEMORYSTATUSEX memstat;
+				memstat.dwLength = sizeof(memstat);
+				if (GlobalMemoryStatusEx(&memstat))
+					ram_total = (int64_t)(
+						memstat.ullTotalPhys /
+						(1024 * 1024));
+			}
+			{
+				FILETIME ct, et, kt, ut;
+				FILETIME now_ft;
+				if (GetProcessTimes(GetCurrentProcess(),
+						&ct, &et, &kt, &ut)) {
+					ULARGE_INTEGER kernel, user, now_time;
+					SYSTEM_INFO sysinfo;
+					kernel.LowPart = kt.dwLowDateTime;
+					kernel.HighPart = kt.dwHighDateTime;
+					user.LowPart = ut.dwLowDateTime;
+					user.HighPart = ut.dwHighDateTime;
+					GetSystemTimeAsFileTime(&now_ft);
+					now_time.LowPart = now_ft.dwLowDateTime;
+					now_time.HighPart = now_ft.dwHighDateTime;
+					GetSystemInfo(&sysinfo);
+					if (g_LastSysTime.QuadPart > 0) {
+						ULONGLONG cpu_delta =
+							(kernel.QuadPart -
+								g_LastCpuKernel.QuadPart) +
+							(user.QuadPart -
+								g_LastCpuUser.QuadPart);
+						ULONGLONG sys_delta =
+							now_time.QuadPart -
+							g_LastSysTime.QuadPart;
+						if (sys_delta > 0) {
+							g_CpuUsage = (float)(100.0 *
+								(double)cpu_delta /
+								(double)sys_delta /
+								(double)sysinfo
+									.dwNumberOfProcessors);
+						}
+					}
+					g_LastCpuKernel = kernel;
+					g_LastCpuUser = user;
+					g_LastSysTime = now_time;
+				}
+			}
+			/* Query GPU utilization via NVML */
+			if (g_NvmlGetUtil && g_NvmlDevice) {
+				nvmlUtilization_t util;
+				if (g_NvmlGetUtil(g_NvmlDevice, &util) == 0)
+					g_GpuUsage = (float)util.gpu;
+			}
+#endif
+			snprintf(g_StatsBuf, sizeof(g_StatsBuf),
+				"FPS: %.0f | CPU: %.0f%% | GPU: %.0f%% | RAM: %lld/%lldMB | VRAM: %lld/%lldMB",
+				fps, g_CpuUsage, g_GpuUsage,
+				(long long)ram_mb, (long long)ram_total,
+				(long long)vram_mb, (long long)vram_max);
+			g_StatsBufWidth =
+				ImGui::CalcTextSize(g_StatsBuf).x + 16.0f;
+		}
+		ImGui::SameLine(
+			ImGui::GetWindowWidth() - g_StatsBufWidth);
+		ImGui::TextColored(ImVec4(0.7f, 0.9f, 0.7f, 1.0f),
+			"%s", g_StatsBuf);
 	}
+	ac_imgui_end_toolbar(g_AcImgui);
 	ac_imgui_viewport(g_AcImgui);
 	ac_console_render(g_AcConsole);
 	ae_terrain_imgui(g_AeTerrain);
 	ae_object_imgui(g_AeObject);
+	ae_octree_imgui(g_AeOctree);
+	ae_grass_edit_imgui(g_AeGrass);
+	ae_object_browser_imgui(g_AeObjectBrowser);
 	ae_editor_action_render_editors(g_AeEditorAction);
 	ae_editor_action_render_outliner(g_AeEditorAction);
 	ae_editor_action_render_properties(g_AeEditorAction);
 	ac_imgui_begin_toolbox(g_AcImgui);
 	ae_terrain_toolbox(g_AeTerrain);
+	ae_octree_toolbox(g_AeOctree);
+	ae_grass_edit_toolbox(g_AeGrass);
+	ae_object_browser_toolbox(g_AeObjectBrowser);
 	ac_imgui_end_toolbox(g_AcImgui);
 	ae_editor_action_render_add_menu(g_AeEditorAction);
 	ac_imgui_render(g_AcImgui);
@@ -799,7 +1036,7 @@ static void update_camera(
 {
 	const boolean * key_state = ctrl->key_state;
 	float speed =
-		key_state[SDL_SCANCODE_LSHIFT] ? 1000.0f : 10000.0f;
+		key_state[SDL_SCANCODE_LSHIFT] ? 30000.0f : 10000.0f;
 	uint32_t mb_state = SDL_GetMouseState(NULL, NULL);
 	if (key_state[SDL_SCANCODE_W])
 		ac_camera_translate(cam, dt * speed, 0.f, 0.f);
@@ -818,47 +1055,26 @@ static void update_camera(
 		ac_camera_translate(cam, 
 			speed * dt, 0.0f, 0.0f);
 	}
-	if (g_RegionLock) {
-		cam->center_dst[0] = glm_clamp(cam->center_dst[0],
-			g_RegionMin[0], g_RegionMax[0]);
-		cam->center_dst[2] = glm_clamp(cam->center_dst[2],
-			g_RegionMin[1], g_RegionMax[1]);
-	}
 	ac_camera_update(cam, dt);
 }
 
-struct region_scan_result {
-	float centroid[2];
-	uint32_t grid_min_x;
-	uint32_t grid_min_z;
-	uint32_t grid_width;
-	uint32_t grid_height;
-	boolean * grid;
-	uint8_t * segment_mask;
-	uint32_t mask_width;
-	uint32_t mask_height;
-	float mask_begin[2];
-	float mask_length;
-};
-
-/*
- * Scan node_data to build a per-sector boolean grid
- * for a target region. Uses the same per-segment region_id
- * lookup as the game server (as_map_get_region_at).
- *
- *   Pass 1: Find all sectors with ANY matching segment,
- *           compute centroid, determine sector index bounds.
- *   Pass 2: Filter out distant outlier sectors (>3 div
- *           from centroid) and build the boolean grid.
- */
-static boolean find_region_sectors(
-	uint32_t target_region_id,
-	struct region_scan_result * result)
+static void setspawnpos(struct ac_camera * cam)
 {
-	const char * node_path = ap_config_get(g_ApConfig, "ServerNodePath");
-	size_t size = 0;
-	void * data;
-	uint32_t * cursor;
+	vec3 center = { -462922.5f, 3217.9f, -44894.8f };
+	const char * pos_cfg = ap_config_get(g_ApConfig, "EditorStartPosition");
+	if (pos_cfg) {
+		vec3 c = { 0 };
+		int parsed = sscanf(pos_cfg, "%f,%f,%f", &c[0], &c[1], &c[2]);
+		if (parsed == 3)
+			glm_vec3_copy(c, center);
+	}
+	ac_camera_init(cam, center, 5000.0f, 45.0f, 30.0f, 60.0f, 100.0f, 400000.0f);
+	ac_terrain_sync(g_AcTerrain, cam->center, TRUE);
+	ac_object_sync(g_AcObject, cam->center, TRUE);
+	ae_grass_edit_sync(g_AeGrass, cam->center, TRUE);
+}
+/* REMOVED: find_region_sectors, apply_region_filter */
+#if 0
 	double sum_x = 0.0;
 	double sum_z = 0.0;
 	uint32_t match_count = 0;
@@ -1087,11 +1303,12 @@ static void apply_region_filter(
 		ac_object_clear_segment_mask(g_AcObject);
 		g_RegionLock = FALSE;
 		ac_terrain_set_view_distance(g_AcTerrain,
-			AP_SECTOR_WIDTH * 4);
+			AP_SECTOR_WIDTH * (float)g_ViewDistMultiplier);
 		ac_object_set_view_distance(g_AcObject,
-			AP_SECTOR_WIDTH * 4);
+			AP_SECTOR_WIDTH * (float)g_ViewDistMultiplier);
 		ac_terrain_sync(g_AcTerrain, cam->center, TRUE);
 		ac_object_sync(g_AcObject, cam->center, TRUE);
+		ae_grass_edit_sync(g_AeGrass, cam->center, TRUE);
 		return;
 	}
 	{
@@ -1136,6 +1353,7 @@ static void apply_region_filter(
 				scan.grid_width, scan.grid_height, vd);
 			ac_terrain_sync(g_AcTerrain, cam->center, TRUE);
 			ac_object_sync(g_AcObject, cam->center, TRUE);
+			ae_grass_edit_sync(g_AeGrass, cam->center, TRUE);
 			dealloc(scan.grid);
 			dealloc(scan.segment_mask);
 		} else {
@@ -1144,22 +1362,7 @@ static void apply_region_filter(
 		}
 	}
 }
-
-static void setspawnpos(struct ac_camera * cam)
-{
-	vec3 center = { -462922.5f, 3217.9f, -44894.8f };
-	const char * pos_cfg = ap_config_get(g_ApConfig, "EditorStartPosition");
-	if (pos_cfg) {
-		vec3 c = { 0 };
-		if (sscanf(pos_cfg, "%f,%f,%f", &c[0], &c[1], &c[2]))
-			glm_vec3_copy(c, center);
-	}
-	INFO("setspawnpos: center=[%.1f,%.1f,%.1f]",
-		center[0], center[1], center[2]);
-	ac_camera_init(cam, center, 5000.0f, 45.0f, 30.0f, 60.0f, 100.0f, 400000.0f);
-	ac_terrain_sync(g_AcTerrain, cam->center, TRUE);
-	ac_object_sync(g_AcObject, cam->center, TRUE);
-}
+#endif
 
 static void handleinput(
 	SDL_Event * e, 
@@ -1194,13 +1397,14 @@ static void handleinput(
 			uint32_t mb_state = SDL_GetMouseState(NULL, NULL);
 			if (mb_state & SDL_BUTTON(SDL_BUTTON_RIGHT))
 				break;
+			ae_grass_edit_on_mdown(g_AeGrass, cam, e->button.x, e->button.y);
 			ae_terrain_on_mdown(g_AeTerrain, cam, e->button.x, e->button.y);
 			ae_editor_action_pick(g_AeEditorAction, cam, e->button.x, e->button.y);
 		}
 		break;
-	case SDL_MOUSEBUTTONUP:
-		break;
 	case SDL_KEYDOWN:
+		if (ae_grass_edit_on_key_down(g_AeGrass, e->key.keysym.sym))
+			break;
 		if (ae_terrain_on_key_down(g_AeTerrain, e->key.keysym.sym))
 			break;
 		if (ae_object_on_key_down(g_AeObject, cam, e->key.keysym.sym))
@@ -1250,6 +1454,29 @@ int main(int argc, char * argv[])
 	}
 	cam = ac_camera_get_main(g_AcCamera);
 	setspawnpos(cam);
+	{
+		const char * vd_str = ap_config_get(g_ApConfig,
+			"ViewDistance");
+		if (vd_str) {
+			int vd = atoi(vd_str);
+			if (vd == 4 || vd == 6 || vd == 8 || vd == 10) {
+				g_ViewDistMultiplier = vd;
+				ac_terrain_set_view_distance(g_AcTerrain,
+					AP_SECTOR_WIDTH * (float)vd);
+				ac_object_set_view_distance(g_AcObject,
+					AP_SECTOR_WIDTH * (float)vd);
+			}
+		}
+	}
+	{
+		const char * fps_str = ap_config_get(g_ApConfig,
+			"ShowFps");
+		if (fps_str && atoi(fps_str))
+			g_ShowFps = true;
+	}
+#ifdef _WIN32
+	init_nvml();
+#endif
 	last = ap_tick_get(g_ApTick);
 	INFO("Entering main loop..");
 	while (!core_should_shutdown()) {
@@ -1267,6 +1494,7 @@ int main(int argc, char * argv[])
 		ac_terrain_update(g_AcTerrain, dt);
 		ac_object_sync(g_AcObject, cam->center, FALSE);
 		ac_object_update(g_AcObject, dt);
+		ae_grass_edit_sync(g_AeGrass, cam->center, FALSE);
 		ae_terrain_update(g_AeTerrain, dt);
 		ae_texture_process_loading_queue(g_AeTexture, 5);
 		ae_object_update(g_AeObject, dt);

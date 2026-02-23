@@ -73,12 +73,12 @@ static boolean onregister(
 	for (i = 0; i < AC_DAT_DIR_COUNT; i++) {
 		char path[512];
 		make_path(path, sizeof(path), "%s/%s",
-			ap_config_get(mod->ap_config, "ClientDir"), 
+			ap_config_get(mod->ap_config, "ClientDir"),
 			ac_dat_get_dir_path(i));
 		if (!ac_dat_load(mod, path, "1111", &mod->dict[i])) {
-			ERROR("Failed to load packed directory (%s).",
+			WARN("Failed to load packed directory (%s).",
 				path);
-			return FALSE;
+			mod->dict[i] = NULL;
 		}
 	}
 	return TRUE;

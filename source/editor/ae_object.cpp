@@ -511,6 +511,7 @@ static boolean cbtransformcanceltarget(struct ae_object_module * mod, void * dat
 	return TRUE;
 }
 
+
 static boolean onregister(
 	struct ae_object_module * mod,
 	struct ap_module_registry * registry)
@@ -609,7 +610,7 @@ boolean ae_object_on_key_down(
 	switch (keycode) {
 	case SDLK_d:
 		if (state[SDL_SCANCODE_LSHIFT] && mod->active_object) {
-			mod->active_object = ap_object_duplicate(mod->ap_object, 
+			mod->active_object = ap_object_duplicate(mod->ap_object,
 				mod->active_object);
 		}
 		break;
@@ -730,4 +731,29 @@ void ae_object_imgui(struct ae_object_module * mod)
 {
 	rendertemplateselectionwindow(mod);
 	renderaddobjectpopup(mod);
+}
+
+struct ap_object * ae_object_place_from_template(
+	struct ae_object_module * mod,
+	struct ap_object_template * temp,
+	const struct au_pos * pos)
+{
+	struct ac_object_template * attachment =
+		ac_object_get_template(temp);
+	struct ap_object * obj = ap_object_create(mod->ap_object);
+	struct ac_object * objc =
+		ac_object_get_object(mod->ac_object, obj);
+	obj->tid = temp->tid;
+	obj->temp = temp;
+	obj->scale.x = 1.0f;
+	obj->scale.y = 1.0f;
+	obj->scale.z = 1.0f;
+	obj->object_type = temp->type;
+	objc->object_type = attachment->object_type;
+	ap_object_move_object(mod->ap_object, obj, pos);
+	ac_object_reference_template(mod->ac_object, attachment);
+	settooltarget(mod, obj);
+	mod->active_object = obj;
+	ae_transform_tool_switch_translate(mod->ae_transform_tool);
+	return obj;
 }

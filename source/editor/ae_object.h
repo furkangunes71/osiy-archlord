@@ -35,6 +35,11 @@ boolean ae_object_on_key_down(
 
 void ae_object_imgui(struct ae_object_module * mod);
 
+struct ap_object * ae_object_place_from_template(
+	struct ae_object_module * mod,
+	struct ap_object_template * temp,
+	const struct au_pos * pos);
+
 static inline struct ae_object_template * ae_object_get_template(
 	struct ap_object_template * temp)
 {

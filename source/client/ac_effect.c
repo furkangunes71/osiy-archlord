@@ -481,8 +481,7 @@ static boolean readeffectsets(struct ac_effect_module * mod)
 static boolean oninitialize(struct ac_effect_module * mod)
 {
 	if (!readeffectsets(mod)) {
-		ERROR("Failed to read effect sets.");
-		return FALSE;
+		WARN("Failed to read effect sets, effects will be unavailable.");
 	}
 	return TRUE;
 }

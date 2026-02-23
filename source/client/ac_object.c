@@ -77,6 +77,7 @@ struct ac_object_module {
 	struct ap_scr_index * visible_sectors;
 	struct ap_scr_index * visible_sectors_tmp;
 	struct ac_object_sector sectors[AP_SECTOR_WORLD_INDEX_WIDTH][AP_SECTOR_WORLD_INDEX_HEIGHT];
+	uint32_t global_max_id;
 	bgfx_texture_handle_t null_tex;
 	bgfx_uniform_handle_t sampler[5];
 	bgfx_program_handle_t program;
@@ -511,41 +512,67 @@ boolean ac_object_object_write(
 	return TRUE;
 }
 
+struct scan_id_ctx {
+	uint32_t max_id;
+	uint32_t file_count;
+};
+
+static boolean scan_ini_cb(
+	char * current_dir,
+	size_t maxcount,
+	const char * name,
+	size_t size,
+	void * user_data)
+{
+	struct scan_id_ctx * ctx = (struct scan_id_ctx *)user_data;
+	char path[512];
+	char line[256];
+	FILE * f;
+	if (strncmp(name, "obj", 3) != 0)
+		return TRUE;
+	if (!strstr(name, ".ini"))
+		return TRUE;
+	make_path(path, sizeof(path), "%s/%s", current_dir, name);
+	f = fopen(path, "r");
+	if (!f)
+		return TRUE;
+	while (fgets(line, sizeof(line), f)) {
+		uint32_t id;
+		if (line[0] != '[')
+			continue;
+		id = (uint32_t)strtoul(line + 1, NULL, 10);
+		if (id > ctx->max_id)
+			ctx->max_id = id;
+	}
+	fclose(f);
+	ctx->file_count++;
+	return TRUE;
+}
+
+static void scan_ini_max_id(struct ac_object_module * mod)
+{
+	const char * clientdir =
+		ap_config_get(mod->ap_config, "ClientDir");
+	char dir_path[512];
+	struct scan_id_ctx ctx = { 0, 0 };
+	if (!clientdir)
+		return;
+	strlcpy(dir_path, clientdir, sizeof(dir_path));
+	strlcat(dir_path, "/ini", sizeof(dir_path));
+	enum_dir(dir_path, sizeof(dir_path), FALSE,
+		scan_ini_cb, &ctx);
+	mod->global_max_id = ctx.max_id;
+	INFO("Scanned %u obj INI files, max object ID: %u",
+		ctx.file_count, ctx.max_id);
+}
+
 static uint32_t get_unique_object_id(
 	struct ac_object_module * mod,
 	uint32_t sector_x,
 	uint32_t sector_z)
 {
-	uint32_t i;
-	uint32_t div_index;
-	if (!ap_scr_div_index_from_sector_index(sector_x, sector_z, &div_index))
-		return UINT32_MAX;
-	div_index <<= 16;
-	for (i = 1; i < 0xFFFF; i++) {
-		uint32_t x;
-		uint32_t id = div_index | i;
-		boolean unique = TRUE;
-		for (x = sector_x; unique && x < sector_x + AP_SECTOR_DEFAULT_DEPTH; x++) {
-			uint32_t z;
-			for (z = sector_z; unique && z < sector_z + AP_SECTOR_DEFAULT_DEPTH; z++) {
-				uint32_t j;
-				uint32_t count;
-				struct ac_object_sector *s = &mod->sectors[x][z];
-				if (!s->objects)
-					continue;
-				count = vec_count(s->objects);
-				for (j = 0; j < count; j++) {
-					if (s->objects[j]->object_id == id) {
-						unique = FALSE;
-						break;
-					}
-				}
-			}
-		}
-		if (unique)
-			return id;
-	}
-	return UINT32_MAX;
+	mod->global_max_id++;
+	return mod->global_max_id;
 }
 
 static uint32_t get_unique_object_id_from_list(
@@ -1162,13 +1189,14 @@ static boolean oninitialize(struct ac_object_module * mod)
 	struct ac_dat_resource * res;
 	uint32_t count;
 	uint32_t i;
+	scan_ini_max_id(mod);
 	if (!create_shaders(mod)) {
 		ERROR("Failed to create object shaders.");
 		return FALSE;
 	}
 	if (!ac_dat_batch_begin(mod->ac_dat, AC_DAT_DIR_WORLD_OCTREE)) {
-		ERROR("Failed to load octree data.");
-		return FALSE;
+		WARN("Failed to load octree data, octree will be unavailable.");
+		return TRUE;
 	}
 	res = ac_dat_get_resources(mod->ac_dat, AC_DAT_DIR_WORLD_OCTREE, &count);
 	for (i = 0; i < count; i++) {
@@ -1262,7 +1290,7 @@ struct ac_object_module * ac_object_create_module()
 	uint32_t x;
 	uint32_t z;
 	uint32_t i;
-	mod->view_distance = AP_SECTOR_WIDTH * 4;
+	mod->view_distance = AP_SECTOR_WIDTH * 6;
 	for (x = 0; x < AP_SECTOR_WORLD_INDEX_WIDTH; x++) {
 		for (z = 0; z < AP_SECTOR_WORLD_INDEX_HEIGHT; z++) {
 			mod->sectors[x][z].extent_start[0] =

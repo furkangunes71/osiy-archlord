@@ -411,3 +411,4 @@ content/shaders
 .claude
 .exe
 editor_x64*
+/client

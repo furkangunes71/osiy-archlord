@@ -147,6 +147,7 @@ boolean read_file(file file, void * buffer, size_t count)
 boolean read_line(file file, char * dst, size_t maxcount)
 {
 	FILE * f = file;
+	const char * start = dst;
 	char c = '\0';
 	if (!maxcount)
 		return FALSE;
@@ -177,7 +178,7 @@ boolean read_line(file file, char * dst, size_t maxcount)
 		}
 	}
 	*dst = '\0';
-	return (c != EOF);
+	return (dst != start);
 }
 
 const char * read_line_buffer(

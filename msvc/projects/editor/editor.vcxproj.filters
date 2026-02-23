@@ -198,6 +198,15 @@
     <ClInclude Include="..\..\..\source\editor\ae_object.h">
       <Filter>source\editor</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\..\source\editor\ae_object_browser.h">
+      <Filter>source\editor</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\source\editor\ae_grass_edit.h">
+      <Filter>source\editor</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\source\editor\ae_octree.h">
+      <Filter>source\editor</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\..\source\public\ap_auction.h">
       <Filter>source\public</Filter>
     </ClInclude>
@@ -561,6 +570,15 @@
       <Filter>source\editor</Filter>
     </ClCompile>
     <ClCompile Include="..\..\..\source\editor\ae_object.cpp">
+      <Filter>source\editor</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\..\source\editor\ae_object_browser.cpp">
+      <Filter>source\editor</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\..\source\editor\ae_grass_edit.cpp">
+      <Filter>source\editor</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\..\source\editor\ae_octree.cpp">
       <Filter>source\editor</Filter>
     </ClCompile>
     <ClCompile Include="..\..\..\source\public\ap_auction.c">

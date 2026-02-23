@@ -292,6 +292,11 @@ void ac_terrain_set_region_id(
 	uint32_t size,
 	uint32_t region_id);
 
+void ac_terrain_replace_region_id(
+	struct ac_terrain_module * mod,
+	uint32_t old_region_id,
+	uint32_t new_region_id);
+
 void ac_terrain_set_tile_info(
 	struct ac_terrain_module * mod,
 	vec3 pos,

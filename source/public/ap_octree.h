@@ -191,7 +191,11 @@ boolean ap_octree_save_to_files(
 	uint32_t load_z1,
 	uint32_t load_z2);
 
-//void SaveNode(struct ap_octree_node * node,int32_t* Foffset,HANDLE fd,uint32_t* FP);
+boolean ap_octree_save_division(
+	const char * file_path,
+	struct ap_octree_root * roots[AP_SECTOR_DEFAULT_DEPTH][AP_SECTOR_DEFAULT_DEPTH]);
+
+uint32_t ap_octree_count_nodes(struct ap_octree_node * node);
 
 struct ap_octree_root * ap_octree_load_from_file(
 	const char * file_path,

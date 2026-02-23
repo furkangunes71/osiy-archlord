@@ -15,7 +15,7 @@ enum ae_transform_tool_callback_id {
 };
 
 typedef void (*ae_transform_tool_translate_callback_t)(
-	ap_module_t mod, 
+	ap_module_t mod,
 	const struct au_pos * destination);
 
 struct ae_transform_tool_module * ae_transform_tool_create_module();

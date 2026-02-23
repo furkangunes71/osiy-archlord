@@ -46,6 +46,7 @@ struct browser_instance {
 	boolean is_open;
 	char title[128];
 	struct browser_data * data;
+	char filter[128];
 };
 
 struct ae_texture_module {
@@ -202,6 +203,7 @@ uint32_t ae_texture_browse(
 		return UINT32_MAX;
 	browser->in_use = TRUE;
 	browser->is_open = TRUE;
+	browser->filter[0] = '\0';
 	strlcpy(browser->title, title, sizeof(browser->title));
 	return i;
 }
@@ -241,14 +243,24 @@ boolean ae_texture_do_browser(
 		ImGui::End();
 		return FALSE;
 	}
+	ImGui::SetNextItemWidth(-1.0f);
+	ImGui::InputTextWithHint("##TexFilter", "Search...",
+		instance->filter, sizeof(instance->filter));
+	ImGui::Separator();
+	if (ImGui::BeginChild("##TexGrid", ImVec2(0, 0), false)) {
+	boolean first_visible = TRUE;
 	for (i = 0; i < data->tex_count; i++) {
 		ImVec2 avail;
 		const struct browser_tex * t = &data->textures[i];
-		if (i)
+		if (instance->filter[0] && !stristr(t->name, instance->filter))
+			continue;
+		if (!first_visible)
 			ImGui::SameLine(0.0f, -1.0f);
+		first_visible = FALSE;
 		avail = ImGui::GetContentRegionAvail();
-		if (avail.x < 128.f)
+		if (avail.x < 128.f) {
 			ImGui::NewLine();
+		}
 		if (BGFX_HANDLE_IS_VALID(t->handle)) {
 			ImGui::Image((ImTextureID)t->handle.idx,
 				ImVec2(128.f, 128.f),
@@ -265,6 +277,7 @@ boolean ae_texture_do_browser(
 			ImGui::EndTooltip();
 		}
 		if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+			ImGui::EndChild();
 			ImGui::End();
 			if (selected_tex) {
 				*selected_tex = t->handle;
@@ -274,6 +287,8 @@ boolean ae_texture_do_browser(
 			return TRUE;
 		}
 	}
+	}
+	ImGui::EndChild();
 	ImGui::End();
 	return FALSE;
 }

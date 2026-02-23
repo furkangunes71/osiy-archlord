@@ -655,14 +655,174 @@ uint32_t ap_octree_get_leaf_id(
 	return res_id;
 }
 
+static void save_node(
+	uint32_t ** buf,
+	uint32_t * count,
+	uint32_t * capacity,
+	struct ap_octree_node * node)
+{
+	uint32_t i;
+	if (*count + 9 > *capacity) {
+		*capacity = (*capacity < 256) ? 256 : *capacity * 2;
+		*buf = reallocate(*buf, *capacity * sizeof(uint32_t));
+	}
+	(*buf)[(*count)++] = node->id;
+	(*buf)[(*count)++] = (uint32_t)node->objectnum;
+	(*buf)[(*count)++] = (uint32_t)node->has_child;
+	((float *)(*buf))[(*count)++] = node->bsphere.radius;
+	((float *)(*buf))[(*count)++] = node->bsphere.center.x;
+	((float *)(*buf))[(*count)++] = node->bsphere.center.y;
+	((float *)(*buf))[(*count)++] = node->bsphere.center.z;
+	(*buf)[(*count)++] = node->hsize;
+	(*buf)[(*count)++] = (uint32_t)node->level;
+	if (node->has_child) {
+		for (i = 0; i < 8; i++) {
+			assert(node->child[i] != NULL);
+			save_node(buf, count, capacity, node->child[i]);
+		}
+	}
+}
+
+uint32_t ap_octree_count_nodes(struct ap_octree_node * node)
+{
+	uint32_t count = 1;
+	if (node->has_child) {
+		uint32_t i;
+		for (i = 0; i < 8; i++) {
+			if (node->child[i])
+				count += ap_octree_count_nodes(node->child[i]);
+		}
+	}
+	return count;
+}
+
+boolean ap_octree_save_division(
+	const char * file_path,
+	struct ap_octree_root * roots[AP_SECTOR_DEFAULT_DEPTH][AP_SECTOR_DEFAULT_DEPTH])
+{
+	uint32_t version = 1;
+	uint32_t index_table[AP_SECTOR_DEFAULT_DEPTH][AP_SECTOR_DEFAULT_DEPTH][2];
+	uint32_t * node_buf = NULL;
+	uint32_t node_count = 0;
+	uint32_t node_capacity = 0;
+	uint32_t data_offset;
+	uint32_t z;
+	uint8_t * file_buf;
+	uint32_t file_size;
+	uint32_t header_size = 4 + AP_SECTOR_DEFAULT_DEPTH *
+		AP_SECTOR_DEFAULT_DEPTH * 8;
+	uint8_t * sector_data = NULL;
+	uint32_t sector_data_size = 0;
+	uint32_t sector_data_capacity = 0;
+	memset(index_table, 0, sizeof(index_table));
+	data_offset = header_size;
+	/* First pass: serialize all sector data and build index table. */
+	for (z = 0; z < AP_SECTOR_DEFAULT_DEPTH; z++) {
+		uint32_t x;
+		for (x = 0; x < AP_SECTOR_DEFAULT_DEPTH; x++) {
+			struct ap_octree_root * root = roots[x][z];
+			struct ap_octree_root_list * cur;
+			uint32_t sector_start;
+			if (!root || !root->roots) {
+				index_table[x][z][0] = 0;
+				index_table[x][z][1] = 0;
+				continue;
+			}
+			node_count = 0;
+			/* rootnum */
+			if (node_count + 1 + root->rootnum > node_capacity) {
+				node_capacity = (node_capacity < 256) ?
+					256 : node_capacity * 2;
+				node_buf = reallocate(node_buf,
+					node_capacity * sizeof(uint32_t));
+			}
+			node_buf[node_count++] = root->rootnum;
+			/* center_y for each root */
+			cur = root->roots;
+			while (cur) {
+				if (node_count + 1 > node_capacity) {
+					node_capacity *= 2;
+					node_buf = reallocate(node_buf,
+						node_capacity * sizeof(uint32_t));
+				}
+				((float *)node_buf)[node_count++] =
+					cur->node->bsphere.center.y;
+				cur = cur->next;
+			}
+			/* node data for each root */
+			cur = root->roots;
+			while (cur) {
+				save_node(&node_buf, &node_count,
+					&node_capacity, cur->node);
+				cur = cur->next;
+			}
+			/* Append to sector_data buffer */
+			sector_start = sector_data_size;
+			{
+				uint32_t needed = sector_data_size +
+					node_count * sizeof(uint32_t);
+				if (needed > sector_data_capacity) {
+					sector_data_capacity = (needed < 4096) ?
+						4096 : needed * 2;
+					sector_data = reallocate(sector_data,
+						sector_data_capacity);
+				}
+			}
+			memcpy(sector_data + sector_data_size, node_buf,
+				node_count * sizeof(uint32_t));
+			sector_data_size += node_count * sizeof(uint32_t);
+			index_table[x][z][0] = data_offset + sector_start;
+			index_table[x][z][1] = node_count * sizeof(uint32_t);
+		}
+	}
+	/* Build final file buffer. */
+	file_size = header_size + sector_data_size;
+	file_buf = alloc(file_size);
+	/* Version */
+	memcpy(file_buf, &version, 4);
+	/* Index table: written in z-major order matching load code. */
+	{
+		uint32_t pos = 4;
+		for (z = 0; z < AP_SECTOR_DEFAULT_DEPTH; z++) {
+			uint32_t x;
+			for (x = 0; x < AP_SECTOR_DEFAULT_DEPTH; x++) {
+				memcpy(file_buf + pos, &index_table[x][z][0], 4);
+				pos += 4;
+				memcpy(file_buf + pos, &index_table[x][z][1], 4);
+				pos += 4;
+			}
+		}
+	}
+	/* Sector data */
+	if (sector_data_size)
+		memcpy(file_buf + header_size, sector_data, sector_data_size);
+	/* Write to file */
+	if (!make_file(file_path, file_buf, file_size)) {
+		ERROR("Failed to write octree file: %s", file_path);
+		dealloc(file_buf);
+		if (node_buf)
+			dealloc(node_buf);
+		if (sector_data)
+			dealloc(sector_data);
+		return FALSE;
+	}
+	dealloc(file_buf);
+	if (node_buf)
+		dealloc(node_buf);
+	if (sector_data)
+		dealloc(sector_data);
+	return TRUE;
+}
+
 boolean ap_octree_save_to_files(
 	const char * dir,
 	uint32_t load_x1,
 	uint32_t load_x2,
 	uint32_t load_z1,
-	uint32_t load_z2);
-
-//void SaveNode(struct ap_octree_node * node,int32_t* Foffset,HANDLE fd,uint32_t* FP);
+	uint32_t load_z2)
+{
+	return FALSE;
+}
 
 struct ap_octree_root * ap_octree_load_from_file(
 	const char * file_path,

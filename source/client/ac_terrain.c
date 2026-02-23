@@ -1485,7 +1485,7 @@ struct ac_terrain_module * ac_terrain_create_module()
 	uint32_t x;
 	uint32_t z;
 	uint32_t i;
-	mod->view_distance = AP_SECTOR_WIDTH * 4;
+	mod->view_distance = AP_SECTOR_WIDTH * 6;
 	for (x = 0; x < AP_SECTOR_WORLD_INDEX_WIDTH; x++) {
 		for (z = 0; z < AP_SECTOR_WORLD_INDEX_HEIGHT; z++) {
 			mod->sectors[x][z].extent_start[0] =
@@ -2919,6 +2919,38 @@ void ac_terrain_set_region_id(
 			s->flags |= AC_TERRAIN_SECTOR_HAS_SEGMENT_CHANGES;
 			count++;
 		}
+	}
+	if (count)
+		modified_segments(mod);
+}
+
+void ac_terrain_replace_region_id(
+	struct ac_terrain_module * mod,
+	uint32_t old_region_id,
+	uint32_t new_region_id)
+{
+	uint32_t i;
+	uint32_t count = 0;
+	for (i = 0; i < vec_count(mod->visible_sectors); i++) {
+		struct ac_terrain_sector * s = from_sector_index(mod,
+			&mod->visible_sectors[i]);
+		uint32_t x;
+		if (!s || !(s->flags & AC_TERRAIN_SECTOR_DETAIL_IS_LOADED) ||
+			!s->segment_info)
+			continue;
+		for (x = 0; x < 16; x++) {
+			uint32_t z;
+			for (z = 0; z < 16; z++) {
+				struct ac_terrain_segment * seg =
+					&s->segment_info->segments[x][z];
+				if (seg->region_id != old_region_id)
+					continue;
+				seg->region_id = new_region_id;
+				count++;
+			}
+		}
+		if (count)
+			s->flags |= AC_TERRAIN_SECTOR_HAS_SEGMENT_CHANGES;
 	}
 	if (count)
 		modified_segments(mod);
