@@ -229,9 +229,15 @@ struct ae_terrain_module {
 	struct tile_tool * tile;
 	bgfx_texture_handle_t interp_tex[INTERP_COUNT];
 	bgfx_texture_info_t interp_info[INTERP_COUNT];
+#define MAX_ADDITIONAL_REGIONS 8
 	uint32_t active_region_id;
 	uint32_t pending_region_id;
 	boolean region_changed;
+	boolean view_distance_changed;
+	uint32_t additional_region_ids[MAX_ADDITIONAL_REGIONS];
+	uint32_t additional_region_count;
+	boolean region_added;
+	uint32_t pending_add_region_id;
 	struct ac_terrain_sector ** cached_sectors;
 	uint32_t cached_sector_count;
 	bgfx_texture_handle_t * region_textures;
@@ -253,6 +259,30 @@ static void load_layer_definitions(struct ae_terrain_module * mod);
 static void resolve_pending_textures(struct ae_terrain_module * mod);
 static void save_region_layers(struct ae_terrain_module * mod);
 static void load_region_layers(struct ae_terrain_module * mod);
+
+static boolean is_region_active(
+	const struct ae_terrain_module * mod,
+	uint32_t region_id)
+{
+	uint32_t i;
+	if (region_id == mod->active_region_id)
+		return TRUE;
+	for (i = 0; i < mod->additional_region_count; i++) {
+		if (mod->additional_region_ids[i] == region_id)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static boolean is_material_visible_in_region(
+	const struct ac_terrain_sector * sector,
+	const struct ac_mesh_geometry * geo,
+	uint32_t material_index,
+	uint32_t region_id);
+static void accumulate_region_textures(
+	struct ae_terrain_module * mod,
+	struct ac_terrain_sector ** sectors,
+	uint32_t sector_count);
 
 static struct paint_tile_info PAINT_TILES[] = {
 	{ { 0.75f, 0.0f }, { 1.0f, 0.25f }, PAINT_TILE_TOP_LEFT },
@@ -1766,8 +1796,8 @@ static void rebuild_segment_mask(
 			continue;
 		for (sz = 0; sz < 16; sz++) {
 			for (sx = 0; sx < 16; sx++) {
-				if (s->segment_info->segments[sx][sz].region_id ==
-					mod->active_region_id) {
+				if (is_region_active(mod,
+					s->segment_info->segments[sx][sz].region_id)) {
 					uint32_t mx = (s->index_x - smin_x) * 16 + sx;
 					uint32_t mz = (s->index_z - smin_z) * 16 + sz;
 					mask[mz * tex_dim + mx] = 255;
@@ -1788,6 +1818,69 @@ static void rebuild_segment_mask(
 	dealloc(mask);
 }
 
+static void accumulate_region_textures(
+	struct ae_terrain_module * mod,
+	struct ac_terrain_sector ** sectors,
+	uint32_t sector_count)
+{
+	uint32_t i;
+	if (mod->active_region_id == UINT32_MAX)
+		return;
+	for (i = 0; i < sector_count; i++) {
+		struct ac_terrain_sector * s = sectors[i];
+		struct ac_mesh_geometry * g;
+		if (!(s->flags & AC_TERRAIN_SECTOR_DETAIL_IS_LOADED))
+			continue;
+		g = s->geometry;
+		while (g) {
+			uint32_t mi;
+			for (mi = 0; mi < g->material_count; mi++) {
+				uint32_t ti;
+				{
+					boolean visible = FALSE;
+					uint32_t ri;
+					if (is_material_visible_in_region(s, g, mi,
+							mod->active_region_id))
+						visible = TRUE;
+					for (ri = 0; ri < mod->additional_region_count
+							&& !visible; ri++) {
+						if (is_material_visible_in_region(s, g, mi,
+								mod->additional_region_ids[ri]))
+							visible = TRUE;
+					}
+					if (!visible)
+						continue;
+				}
+				for (ti = 0; ti < 5; ti++) {
+					bgfx_texture_handle_t tex =
+						g->materials[mi].tex_handle[ti];
+					uint32_t k;
+					boolean dup = FALSE;
+					if (!BGFX_HANDLE_IS_VALID(tex))
+						continue;
+					for (k = 0;
+						k < vec_count(mod->region_textures);
+						k++) {
+						if (mod->region_textures[k].idx ==
+							tex.idx) {
+							dup = TRUE;
+							break;
+						}
+					}
+					if (!dup) {
+						ac_texture_copy(mod->ac_texture,
+							tex);
+						vec_push_back(
+							(void **)&mod->region_textures,
+							&tex);
+					}
+				}
+			}
+			g = g->next;
+		}
+	}
+}
+
 static boolean cb_post_load_sector(
 	struct ae_terrain_module * mod,
 	struct ac_terrain_cb_post_load_sector * data)
@@ -1805,6 +1898,7 @@ static boolean cb_post_load_sector(
 		memcpy(mod->cached_sectors, data->sectors, sz);
 	}
 	rebuild_segment_mask(mod, data->sectors, data->sector_count);
+	accumulate_region_textures(mod, data->sectors, data->sector_count);
 	resolve_pending_textures(mod);
 	return TRUE;
 }
@@ -1990,6 +2084,8 @@ static void onshutdown(struct ae_terrain_module * mod)
 		if (BGFX_HANDLE_IS_VALID(mod->segment_tex[i]))
 			bgfx_destroy_texture(mod->segment_tex[i]);
 	}
+	for (i = 0; i < vec_count(mod->region_textures); i++)
+		ac_texture_release(mod->ac_texture, mod->region_textures[i]);
 	vec_free(mod->region_textures);
 	if (mod->cached_sectors) {
 		dealloc(mod->cached_sectors);
@@ -2702,48 +2798,6 @@ static void browserregiontextures(struct ae_terrain_module * mod)
 	if (!ImGui::Begin("Region Textures", &mod->browse_region_textures)) {
 		ImGui::End();
 		return;
-	}
-	/* Collect unique textures from visible sectors.
-	 * Only include materials used by segments that belong
-	 * to the active region. */
-	vec_clear(mod->region_textures);
-	for (i = 0; i < mod->cached_sector_count; i++) {
-		struct ac_terrain_sector * s = mod->cached_sectors[i];
-		struct ac_mesh_geometry * g;
-		if (!(s->flags & AC_TERRAIN_SECTOR_DETAIL_IS_LOADED))
-			continue;
-		g = s->geometry;
-		while (g) {
-			uint32_t mi;
-			for (mi = 0; mi < g->material_count; mi++) {
-				uint32_t ti;
-				if (!is_material_visible_in_region(s, g, mi,
-						mod->active_region_id))
-					continue;
-				for (ti = 0; ti < 5; ti++) {
-					bgfx_texture_handle_t tex =
-						g->materials[mi].tex_handle[ti];
-					uint32_t k;
-					boolean add = TRUE;
-					if (!BGFX_HANDLE_IS_VALID(tex))
-						continue;
-					for (k = 0;
-						k < vec_count(mod->region_textures);
-						k++) {
-						if (mod->region_textures[k].idx ==
-							tex.idx) {
-							add = FALSE;
-							break;
-						}
-					}
-					if (add)
-						vec_push_back(
-							(void **)&mod->region_textures,
-							&tex);
-				}
-			}
-			g = g->next;
-		}
 	}
 	count = vec_count(mod->region_textures);
 	for (i = 0; i < count; i++) {
@@ -3644,7 +3698,73 @@ void ae_terrain_toolbar(struct ae_terrain_module * mod)
 			}
 			ImGui::EndCombo();
 		}
+		/* Additional region badges + add button. */
+		if (mod->active_region_id != UINT32_MAX) {
+			uint32_t remove_idx = UINT32_MAX;
+			for (i = 0; i < mod->additional_region_count; i++) {
+				struct ap_map_region_template * t =
+					ap_map_get_region_template(mod->ap_map,
+						mod->additional_region_ids[i]);
+				ImGui::SameLine();
+				if (t)
+					snprintf(label, sizeof(label),
+						"+%u %s", t->id, t->glossary);
+				else
+					snprintf(label, sizeof(label),
+						"+%u", mod->additional_region_ids[i]);
+				if (ImGui::SmallButton(label))
+					remove_idx = i;
+			}
+			if (remove_idx != UINT32_MAX) {
+				/* Shift remaining entries. */
+				for (i = remove_idx;
+					i + 1 < mod->additional_region_count; i++)
+					mod->additional_region_ids[i] =
+						mod->additional_region_ids[i + 1];
+				mod->additional_region_count--;
+				mod->region_added = TRUE;
+				mod->pending_add_region_id = UINT32_MAX;
+			}
+			if (mod->additional_region_count <
+					MAX_ADDITIONAL_REGIONS) {
+				ImGui::SameLine();
+				if (ImGui::SmallButton("+"))
+					ImGui::OpenPopup("AddRegionPopup");
+			}
+			if (ImGui::BeginPopup("AddRegionPopup")) {
+				for (i = 0;
+					i < COUNT_OF(mod->region.colors); i++) {
+					struct ap_map_region_template * t;
+					if (is_region_active(mod, i))
+						continue;
+					t = ap_map_get_region_template(
+						mod->ap_map, i);
+					if (!t)
+						continue;
+					snprintf(label, sizeof(label),
+						"[%03u] %s", i, t->glossary);
+					if (ImGui::Selectable(label)) {
+						mod->pending_add_region_id = i;
+						mod->region_added = TRUE;
+					}
+				}
+				ImGui::EndPopup();
+			}
+		}
 		if (mod->active_region_id != UINT32_MAX && mod->cached_sector_count) {
+			float vd = ac_terrain_get_view_distance(mod->ac_terrain);
+			ImGui::SameLine();
+			ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+			ImGui::SameLine();
+			ImGui::SetNextItemWidth(120.f);
+			if (ImGui::DragFloat("View Dist",
+					&vd, AP_SECTOR_WIDTH * 0.5f,
+					AP_SECTOR_WIDTH,
+					AP_SECTOR_WIDTH * 20,
+					"%.0f", 0)) {
+				ac_terrain_set_view_distance(mod->ac_terrain, vd);
+				mod->view_distance_changed = TRUE;
+			}
 			ImGui::SameLine();
 			ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
 			ImGui::SameLine();
@@ -3785,6 +3905,20 @@ boolean ae_terrain_region_changed(struct ae_terrain_module * mod)
 	return FALSE;
 }
 
+boolean ae_terrain_view_distance_changed(struct ae_terrain_module * mod)
+{
+	if (mod->view_distance_changed) {
+		mod->view_distance_changed = FALSE;
+		return TRUE;
+	}
+	return FALSE;
+}
+
+float ae_terrain_get_view_distance(struct ae_terrain_module * mod)
+{
+	return ac_terrain_get_view_distance(mod->ac_terrain);
+}
+
 uint32_t ae_terrain_get_pending_region(struct ae_terrain_module * mod)
 {
 	return mod->pending_region_id;
@@ -3794,12 +3928,16 @@ void ae_terrain_confirm_region(struct ae_terrain_module * mod, uint32_t region_i
 {
 	uint32_t i;
 	mod->active_region_id = region_id;
+	mod->additional_region_count = 0;
 	for (i = 0; i < mod->tex_group_count; i++) {
 		vec_clear(mod->tex_groups[i].textures);
 		if (mod->tex_groups[i].pending_tex_names)
 			vec_clear(mod->tex_groups[i].pending_tex_names);
 	}
 	BGFX_INVALIDATE_HANDLE(mod->highlight_texture);
+	for (i = 0; i < vec_count(mod->region_textures); i++)
+		ac_texture_release(mod->ac_texture, mod->region_textures[i]);
+	vec_clear(mod->region_textures);
 	load_region_layers(mod);
 	/* Resolve pending textures immediately using cached sectors.
 	 * This handles the case where all sectors for the new region
@@ -3807,5 +3945,59 @@ void ae_terrain_confirm_region(struct ae_terrain_module * mod, uint32_t region_i
 	 * Any unresolved names will be resolved when the callback
 	 * fires after new sectors finish loading. */
 	resolve_pending_textures(mod);
+	accumulate_region_textures(mod, mod->cached_sectors,
+		mod->cached_sector_count);
+}
+
+boolean ae_terrain_region_added(struct ae_terrain_module * mod)
+{
+	if (mod->region_added) {
+		mod->region_added = FALSE;
+		return TRUE;
+	}
+	return FALSE;
+}
+
+uint32_t ae_terrain_get_pending_add_region(struct ae_terrain_module * mod)
+{
+	return mod->pending_add_region_id;
+}
+
+void ae_terrain_confirm_add_region(struct ae_terrain_module * mod,
+	uint32_t region_id)
+{
+	uint32_t i;
+	if (region_id == UINT32_MAX) {
+		/* Region was removed, just refresh textures. */
+		for (i = 0; i < vec_count(mod->region_textures); i++)
+			ac_texture_release(mod->ac_texture,
+				mod->region_textures[i]);
+		vec_clear(mod->region_textures);
+		accumulate_region_textures(mod, mod->cached_sectors,
+			mod->cached_sector_count);
+		return;
+	}
+	if (mod->additional_region_count >= MAX_ADDITIONAL_REGIONS)
+		return;
+	mod->additional_region_ids[mod->additional_region_count++] =
+		region_id;
+	for (i = 0; i < vec_count(mod->region_textures); i++)
+		ac_texture_release(mod->ac_texture,
+			mod->region_textures[i]);
+	vec_clear(mod->region_textures);
+	accumulate_region_textures(mod, mod->cached_sectors,
+		mod->cached_sector_count);
+}
+
+void ae_terrain_get_all_region_ids(struct ae_terrain_module * mod,
+	uint32_t * out_ids, uint32_t * out_count)
+{
+	uint32_t n = 0;
+	uint32_t i;
+	if (mod->active_region_id != UINT32_MAX)
+		out_ids[n++] = mod->active_region_id;
+	for (i = 0; i < mod->additional_region_count; i++)
+		out_ids[n++] = mod->additional_region_ids[i];
+	*out_count = n;
 }
 

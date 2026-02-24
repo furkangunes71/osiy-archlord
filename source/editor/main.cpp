@@ -723,6 +723,7 @@ static void updatetick(uint64_t * last, float * dt)
 }
 
 static void apply_region_filter(uint32_t region_id, struct ac_camera * cam);
+static void rebuild_merged_region_filter(struct ac_camera * cam);
 
 static void render(struct ac_camera * cam, float dt)
 {
@@ -755,6 +756,17 @@ static void render(struct ac_camera * cam, float dt)
 		uint32_t region_id = ae_terrain_get_pending_region(g_AeTerrain);
 		apply_region_filter(region_id, cam);
 		ae_terrain_confirm_region(g_AeTerrain, region_id);
+	}
+	if (ae_terrain_region_added(g_AeTerrain)) {
+		uint32_t add_id = ae_terrain_get_pending_add_region(g_AeTerrain);
+		ae_terrain_confirm_add_region(g_AeTerrain, add_id);
+		rebuild_merged_region_filter(cam);
+	}
+	if (ae_terrain_view_distance_changed(g_AeTerrain)) {
+		float vd = ae_terrain_get_view_distance(g_AeTerrain);
+		ac_object_set_view_distance(g_AcObject, vd);
+		ac_terrain_sync(g_AcTerrain, cam->center, TRUE);
+		ac_object_sync(g_AcObject, cam->center, TRUE);
 	}
 	ac_imgui_viewport(g_AcImgui);
 	ac_console_render(g_AcConsole);
@@ -833,6 +845,7 @@ struct region_scan_result {
 	uint32_t grid_min_z;
 	uint32_t grid_width;
 	uint32_t grid_height;
+	uint32_t grid_count;
 	boolean * grid;
 	uint8_t * segment_mask;
 	uint32_t mask_width;
@@ -841,18 +854,32 @@ struct region_scan_result {
 	float mask_length;
 };
 
+static boolean is_target_region(
+	const uint32_t * ids, uint32_t count, uint32_t region_id)
+{
+	uint32_t i;
+	uint32_t rid = region_id & 0x00FF;
+	for (i = 0; i < count; i++) {
+		if (ids[i] == rid)
+			return TRUE;
+	}
+	return FALSE;
+}
+
 /*
  * Scan node_data to build a per-sector boolean grid
- * for a target region. Uses the same per-segment region_id
+ * for target region(s). Uses the same per-segment region_id
  * lookup as the game server (as_map_get_region_at).
  *
- *   Pass 1: Find all sectors with ANY matching segment,
- *           compute centroid, determine sector index bounds.
+ *   Pass 1: Find all sectors with ANY matching segment
+ *           (primary region only), compute centroid.
  *   Pass 2: Filter out distant outlier sectors (>3 div
  *           from centroid) and build the boolean grid.
+ *           Outlier filter is skipped when target_count > 1.
  */
 static boolean find_region_sectors(
-	uint32_t target_region_id,
+	const uint32_t * target_region_ids,
+	uint32_t target_count,
 	struct region_scan_result * result)
 {
 	const char * node_path = ap_config_get(g_ApConfig, "ServerNodePath");
@@ -897,7 +924,7 @@ static boolean find_region_sectors(
 			for (si = 0; si < 256; si++) {
 				uint16_t region_id;
 				memcpy(&region_id, (uint8_t *)cursor + 2, 2);
-				if ((region_id & 0x00FF) == target_region_id) {
+				if ((region_id & 0x00FF) == target_region_ids[0]) {
 					uint32_t sx = si % 16;
 					uint32_t sz = si / 16;
 					sum_x += AP_SECTOR_WORLD_START_X +
@@ -916,8 +943,8 @@ static boolean find_region_sectors(
 		}
 	}
 	if (match_count == 0) {
-		INFO("find_region_sectors: no segments for region_id=%u",
-			target_region_id);
+		INFO("find_region_sectors: no segments for primary region_id=%u",
+			target_region_ids[0]);
 		dealloc(data);
 		return FALSE;
 	}
@@ -933,7 +960,9 @@ static boolean find_region_sectors(
 	INFO("find_region_sectors: centroid=[%.0f,%.0f] sector=[%u,%u] "
 		"(%u segments)", cx, cz, cx_sx, cx_sz, match_count);
 	/* Pass 2: find sectors near centroid that have ANY
-	 * matching segment, compute grid bounds. */
+	 * matching segment, compute grid bounds.
+	 * When target_count > 1, outlier filter is skipped
+	 * so that distant additional regions are included. */
 	cursor = (uint32_t *)data;
 	{
 		size_t remaining = size;
@@ -946,7 +975,8 @@ static boolean find_region_sectors(
 			for (si = 0; si < 256; si++) {
 				uint16_t region_id;
 				memcpy(&region_id, (uint8_t *)cursor + 2, 2);
-				if ((region_id & 0x00FF) == target_region_id)
+				if (is_target_region(target_region_ids,
+						target_count, region_id))
 					has_match = TRUE;
 				cursor++;
 			}
@@ -955,7 +985,8 @@ static boolean find_region_sectors(
 			dz = (AP_SECTOR_WORLD_START_Z +
 				z * AP_SECTOR_HEIGHT + AP_SECTOR_HEIGHT * 0.5f) - cz;
 			if (has_match &&
-				dx * dx + dz * dz <= max_radius * max_radius) {
+				(target_count > 1 ||
+				dx * dx + dz * dz <= max_radius * max_radius)) {
 				if (x < smin_x) smin_x = x;
 				if (z < smin_z) smin_z = z;
 				if (x > smax_x) smax_x = x;
@@ -985,7 +1016,8 @@ static boolean find_region_sectors(
 			for (si = 0; si < 256; si++) {
 				uint16_t region_id;
 				memcpy(&region_id, (uint8_t *)cursor + 2, 2);
-				if ((region_id & 0x00FF) == target_region_id)
+				if (is_target_region(target_region_ids,
+						target_count, region_id))
 					has_match = TRUE;
 				cursor++;
 			}
@@ -994,7 +1026,8 @@ static boolean find_region_sectors(
 			dz = (AP_SECTOR_WORLD_START_Z +
 				z * AP_SECTOR_HEIGHT + AP_SECTOR_HEIGHT * 0.5f) - cz;
 			if (has_match &&
-				dx * dx + dz * dz <= max_radius * max_radius) {
+				(target_count > 1 ||
+				dx * dx + dz * dz <= max_radius * max_radius)) {
 				uint32_t gx = x - smin_x;
 				uint32_t gz = z - smin_z;
 				grid[gz * gw + gx] = TRUE;
@@ -1037,8 +1070,9 @@ static boolean find_region_sectors(
 						uint16_t region_id;
 						memcpy(&region_id,
 							(uint8_t *)cursor + 2, 2);
-						if ((region_id & 0x00FF) ==
-							target_region_id) {
+						if (is_target_region(
+							target_region_ids,
+							target_count, region_id)) {
 							uint32_t sx = si % 16;
 							uint32_t sz = si / 16;
 							uint32_t mx = (x - smin_x) * 16 + sx;
@@ -1068,6 +1102,7 @@ static boolean find_region_sectors(
 	result->grid_width = gw;
 	result->grid_height = gh;
 	result->grid = grid;
+	result->grid_count = grid_count;
 	INFO("find_region_sectors: grid [%u,%u] size %ux%u, "
 		"%u sectors marked, mask %ux%u",
 		smin_x, smin_z, gw, gh, grid_count,
@@ -1096,9 +1131,10 @@ static void apply_region_filter(
 	}
 	{
 		struct region_scan_result scan = { 0 };
-		if (find_region_sectors(region_id, &scan)) {
+		uint32_t ids[1] = { region_id };
+		if (find_region_sectors(ids, 1, &scan)) {
 			float vd;
-			g_RegionLock = TRUE;
+			boolean streaming = scan.grid_count > 64;
 			cam->center[0] = scan.centroid[0];
 			cam->center[2] = scan.centroid[1];
 			cam->center_dst[0] = scan.centroid[0];
@@ -1125,15 +1161,23 @@ static void apply_region_filter(
 				scan.mask_width, scan.mask_height,
 				scan.mask_begin[0], scan.mask_begin[1],
 				scan.mask_length);
-			vd = ((scan.grid_width > scan.grid_height ?
-				scan.grid_width : scan.grid_height) *
-				AP_SECTOR_WIDTH) * 0.5f + AP_SECTOR_WIDTH;
+			if (streaming) {
+				vd = AP_SECTOR_WIDTH * 4;
+				g_RegionLock = FALSE;
+			} else {
+				vd = ((scan.grid_width > scan.grid_height ?
+					scan.grid_width : scan.grid_height) *
+					AP_SECTOR_WIDTH) * 0.5f + AP_SECTOR_WIDTH;
+				g_RegionLock = TRUE;
+			}
 			ac_terrain_set_view_distance(g_AcTerrain, vd);
 			ac_object_set_view_distance(g_AcObject, vd);
 			INFO("apply_region_filter: region=%u grid [%u,%u] %ux%u "
-				"view_distance=%.0f",
+				"%u sectors, view_distance=%.0f%s",
 				region_id, scan.grid_min_x, scan.grid_min_z,
-				scan.grid_width, scan.grid_height, vd);
+				scan.grid_width, scan.grid_height,
+				scan.grid_count, vd,
+				streaming ? " (streaming)" : "");
 			ac_terrain_sync(g_AcTerrain, cam->center, TRUE);
 			ac_object_sync(g_AcObject, cam->center, TRUE);
 			dealloc(scan.grid);
@@ -1143,6 +1187,50 @@ static void apply_region_filter(
 				region_id);
 		}
 	}
+}
+
+static void rebuild_merged_region_filter(struct ac_camera * cam)
+{
+	uint32_t ids[16];
+	uint32_t count = 0;
+	struct region_scan_result scan = { 0 };
+	ae_terrain_get_all_region_ids(g_AeTerrain, ids, &count);
+	if (count == 0)
+		return;
+	if (!find_region_sectors(ids, count, &scan)) {
+		WARN("rebuild_merged_region_filter: no sectors found.");
+		return;
+	}
+	g_RegionMin[0] = ap_scr_get_start_x(scan.grid_min_x);
+	g_RegionMin[1] = ap_scr_get_start_z(scan.grid_min_z);
+	g_RegionMax[0] = ap_scr_get_end_x(
+		scan.grid_min_x + scan.grid_width - 1);
+	g_RegionMax[1] = ap_scr_get_end_z(
+		scan.grid_min_z + scan.grid_height - 1);
+	ac_terrain_set_sector_grid(g_AcTerrain,
+		scan.grid_min_x, scan.grid_min_z,
+		scan.grid_width, scan.grid_height, scan.grid);
+	ac_object_set_sector_grid(g_AcObject,
+		scan.grid_min_x, scan.grid_min_z,
+		scan.grid_width, scan.grid_height, scan.grid);
+	ac_terrain_set_segment_mask(g_AcTerrain,
+		scan.segment_mask,
+		scan.mask_width, scan.mask_height,
+		scan.mask_begin[0], scan.mask_begin[1],
+		scan.mask_length);
+	ac_object_set_segment_mask(g_AcObject,
+		scan.segment_mask,
+		scan.mask_width, scan.mask_height,
+		scan.mask_begin[0], scan.mask_begin[1],
+		scan.mask_length);
+	INFO("rebuild_merged_region_filter: %u regions, grid [%u,%u] "
+		"%ux%u %u sectors",
+		count, scan.grid_min_x, scan.grid_min_z,
+		scan.grid_width, scan.grid_height, scan.grid_count);
+	ac_terrain_sync(g_AcTerrain, cam->center, TRUE);
+	ac_object_sync(g_AcObject, cam->center, TRUE);
+	dealloc(scan.grid);
+	dealloc(scan.segment_mask);
 }
 
 static void setspawnpos(struct ac_camera * cam)

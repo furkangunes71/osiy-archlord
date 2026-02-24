@@ -22,9 +22,22 @@ void ae_terrain_toolbox(struct ae_terrain_module * mod);
 
 boolean ae_terrain_region_changed(struct ae_terrain_module * mod);
 
+boolean ae_terrain_view_distance_changed(struct ae_terrain_module * mod);
+
+float ae_terrain_get_view_distance(struct ae_terrain_module * mod);
+
 uint32_t ae_terrain_get_pending_region(struct ae_terrain_module * mod);
 
 void ae_terrain_confirm_region(struct ae_terrain_module * mod, uint32_t region_id);
+
+boolean ae_terrain_region_added(struct ae_terrain_module * mod);
+
+uint32_t ae_terrain_get_pending_add_region(struct ae_terrain_module * mod);
+
+void ae_terrain_confirm_add_region(struct ae_terrain_module * mod, uint32_t region_id);
+
+void ae_terrain_get_all_region_ids(struct ae_terrain_module * mod,
+	uint32_t * out_ids, uint32_t * out_count);
 
 void ae_terrain_imgui(struct ae_terrain_module * mod);
 
