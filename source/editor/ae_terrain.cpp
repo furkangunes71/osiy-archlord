@@ -14,6 +14,7 @@
 #include "public/ap_sector.h"
 
 #include "client/ac_camera.h"
+#include "client/ac_dat.h"
 #include "client/ac_imgui.h"
 #include "client/ac_mesh.h"
 #include "client/ac_renderware.h"
@@ -1851,9 +1852,17 @@ static void accumulate_region_textures(
 					if (!visible)
 						continue;
 				}
-				for (ti = 0; ti < 5; ti++) {
-					bgfx_texture_handle_t tex =
-						g->materials[mi].tex_handle[ti];
+				/* Only collect surface textures:
+			 *   slot 0 = base, 2 = layer0 color,
+			 *   4 = layer1 color.
+			 * Slots 1,3 are alpha masks. */
+			static const uint32_t surface_slots[] =
+				{ 0, 2, 4 };
+			for (ti = 0;
+				ti < COUNT_OF(surface_slots); ti++) {
+				bgfx_texture_handle_t tex =
+					g->materials[mi].tex_handle[
+						surface_slots[ti]];
 					uint32_t k;
 					boolean dup = FALSE;
 					if (!BGFX_HANDLE_IS_VALID(tex))
@@ -2092,8 +2101,15 @@ static void onshutdown(struct ae_terrain_module * mod)
 		mod->cached_sectors = NULL;
 	}
 	for (i = 0; i < mod->tex_group_count; i++) {
-		if (mod->tex_groups[i].textures)
+		if (mod->tex_groups[i].textures) {
+			uint32_t ti;
+			for (ti = 0;
+				ti < vec_count(mod->tex_groups[i].textures);
+				ti++)
+				ac_texture_release(mod->ac_texture,
+					mod->tex_groups[i].textures[ti]);
 			vec_free(mod->tex_groups[i].textures);
+		}
 		if (mod->tex_groups[i].pending_tex_names)
 			vec_free(mod->tex_groups[i].pending_tex_names);
 	}
@@ -3025,6 +3041,12 @@ static void load_region_layers(struct ae_terrain_module * mod)
 			char pn[64];
 			if (!tex_name)
 				continue;
+			/* Skip rough texture names (e.g. "R329,419").
+			 * These were incorrectly saved in older
+			 * versions and are not surface textures. */
+			if (tex_name[0] == 'R' &&
+				tex_name[1] >= '0' && tex_name[1] <= '9')
+				continue;
 			strlcpy(pn, tex_name, sizeof(pn));
 			vec_push_back((void **)&g->pending_tex_names, &pn);
 		}
@@ -3044,63 +3066,22 @@ static void resolve_pending_textures(struct ae_terrain_module * mod)
 			continue;
 		for (pi = 0; pi < vec_count(g->pending_tex_names); ) {
 			const char * pname = g->pending_tex_names[pi];
-			boolean resolved = FALSE;
-			uint32_t si;
-			for (si = 0; si < mod->cached_sector_count && !resolved;
-				si++) {
-				struct ac_terrain_sector * s =
-					mod->cached_sectors[si];
-				struct ac_mesh_geometry * geo;
-				if (!(s->flags &
-						AC_TERRAIN_SECTOR_DETAIL_IS_LOADED))
-					continue;
-				geo = s->geometry;
-				while (geo && !resolved) {
-					uint32_t mi;
-					for (mi = 0; mi < geo->material_count; mi++) {
-						uint32_t ti;
-						for (ti = 0; ti < 6; ti++) {
-							bgfx_texture_handle_t tex =
-								geo->materials[mi].tex_handle[ti];
-							char tname[64];
-							boolean dup;
-							uint32_t k;
-							if (!BGFX_HANDLE_IS_VALID(tex))
-								continue;
-							if (!ac_texture_get_name(
-									mod->ac_texture, tex, TRUE,
-									tname, sizeof(tname)))
-								continue;
-							if (strcmp(tname, pname) != 0)
-								continue;
-							/* Check duplicate. */
-							dup = FALSE;
-							for (k = 0;
-								k < vec_count(g->textures);
-								k++) {
-								if (g->textures[k].idx ==
-									tex.idx) {
-									dup = TRUE;
-									break;
-								}
-							}
-							if (!dup)
-								vec_push_back(
-									(void **)&g->textures,
-									&tex);
-							resolved = TRUE;
-							break;
-						}
-						if (resolved)
-							break;
-					}
-					geo = geo->next;
-				}
+			bgfx_texture_handle_t tex =
+				ac_texture_load_packed(mod->ac_texture,
+					AC_DAT_DIR_TEX_WORLD, pname,
+					TRUE, NULL);
+			if (BGFX_HANDLE_IS_VALID(tex)) {
+				/* load_packed already increments refcount. */
+				vec_push_back(
+					(void **)&g->textures, &tex);
+				pi = vec_erase_iterator(
+					g->pending_tex_names, pi);
+			} else {
+				WARN("resolve_pending_textures: "
+					"could not load '%s'.", pname);
+				pi = vec_erase_iterator(
+					g->pending_tex_names, pi);
 			}
-			if (resolved)
-				pi = vec_erase_iterator(g->pending_tex_names, pi);
-			else
-				pi++;
 		}
 	}
 }
@@ -3243,6 +3224,8 @@ static void render_layer_window(struct ae_terrain_module * mod)
 					}
 					if (ImGui::IsItemClicked(
 							ImGuiMouseButton_Right)) {
+						ac_texture_release(
+							mod->ac_texture, tex);
 						i = vec_erase_iterator(
 							g->textures, i);
 						count--;
@@ -3276,6 +3259,8 @@ static void render_layer_window(struct ae_terrain_module * mod)
 							}
 						}
 						if (!found) {
+							ac_texture_copy(
+								mod->ac_texture, tex);
 							vec_push_back(
 								(void **)&g->textures,
 								&tex);
@@ -3788,9 +3773,7 @@ void ae_terrain_toolbar(struct ae_terrain_module * mod)
 			ImGui::SameLine();
 			ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
 			ImGui::SameLine();
-			if (ImGui::Button("+",
-					ImVec2(ImGui::GetFrameHeight(),
-						ImGui::GetFrameHeight())))
+			if (ImGui::Button("Layer Groups"))
 				mod->show_layer_window = !mod->show_layer_window;
 			ImGui::SameLine();
 			if (ImGui::Button("Export") &&
@@ -3930,6 +3913,10 @@ void ae_terrain_confirm_region(struct ae_terrain_module * mod, uint32_t region_i
 	mod->active_region_id = region_id;
 	mod->additional_region_count = 0;
 	for (i = 0; i < mod->tex_group_count; i++) {
+		uint32_t ti;
+		for (ti = 0; ti < vec_count(mod->tex_groups[i].textures); ti++)
+			ac_texture_release(mod->ac_texture,
+				mod->tex_groups[i].textures[ti]);
 		vec_clear(mod->tex_groups[i].textures);
 		if (mod->tex_groups[i].pending_tex_names)
 			vec_clear(mod->tex_groups[i].pending_tex_names);
