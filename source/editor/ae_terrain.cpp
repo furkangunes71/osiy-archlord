@@ -208,6 +208,14 @@ struct texture_group {
 	char (* pending_tex_names)[64]; /* vec - names to resolve */
 };
 
+#define MAX_BIOME_GROUPS 32
+#define BIOME_GROUP_NAME_LENGTH 64
+
+struct biome_group {
+	char name[BIOME_GROUP_NAME_LENGTH];
+	uint32_t * region_ids; /* vec */
+};
+
 struct ae_terrain_module {
 	struct ap_module_instance instance;
 	struct ap_map_module * ap_map;
@@ -243,6 +251,7 @@ struct ae_terrain_module {
 	uint32_t cached_sector_count;
 	bgfx_texture_handle_t * region_textures;
 	bool browse_region_textures;
+	bool filter_unassigned_textures;
 	bgfx_texture_handle_t highlight_texture;
 	float highlight_opacity;
 	float highlight_color[3];
@@ -254,12 +263,18 @@ struct ae_terrain_module {
 	char new_layer_name[TEXTURE_GROUP_NAME_LENGTH];
 	bool show_export_confirm;
 	float export_msg_timer;
+	struct biome_group biome_groups[MAX_BIOME_GROUPS];
+	uint32_t biome_group_count;
+	bool show_biome_window;
+	char new_biome_name[BIOME_GROUP_NAME_LENGTH];
 };
 
 static void load_layer_definitions(struct ae_terrain_module * mod);
 static void resolve_pending_textures(struct ae_terrain_module * mod);
 static void save_region_layers(struct ae_terrain_module * mod);
 static void load_region_layers(struct ae_terrain_module * mod);
+static void load_biome_groups(struct ae_terrain_module * mod);
+static void save_biome_groups(struct ae_terrain_module * mod);
 
 static boolean is_region_active(
 	const struct ae_terrain_module * mod,
@@ -880,6 +895,7 @@ static boolean create_shaders(struct ae_terrain_module * mod)
 		return FALSE;
 	}
 	load_layer_definitions(mod);
+	load_biome_groups(mod);
 	return TRUE;
 }
 
@@ -2815,14 +2831,46 @@ static void browserregiontextures(struct ae_terrain_module * mod)
 		ImGui::End();
 		return;
 	}
+	if (mod->filter_unassigned_textures) {
+		if (ImGui::Button("Show All"))
+			mod->filter_unassigned_textures = false;
+	}
+	else {
+		if (ImGui::Button("Unassigned"))
+			mod->filter_unassigned_textures = true;
+	}
+	ImGui::Separator();
 	count = vec_count(mod->region_textures);
+	{
+	uint32_t visible = 0;
 	for (i = 0; i < count; i++) {
 		ImVec2 avail;
 		bgfx_texture_handle_t tex = mod->region_textures[i];
 		boolean is_selected = BGFX_HANDLE_IS_VALID(mod->highlight_texture) &&
 			mod->highlight_texture.idx == tex.idx;
-		if (i)
+		if (mod->filter_unassigned_textures) {
+			uint32_t gi;
+			boolean in_layer = FALSE;
+			for (gi = 0; gi < mod->tex_group_count; gi++) {
+				uint32_t tc = vec_count(
+					mod->tex_groups[gi].textures);
+				uint32_t ti;
+				for (ti = 0; ti < tc; ti++) {
+					if (mod->tex_groups[gi].textures[ti]
+							.idx == tex.idx) {
+						in_layer = TRUE;
+						break;
+					}
+				}
+				if (in_layer)
+					break;
+			}
+			if (in_layer)
+				continue;
+		}
+		if (visible)
 			ImGui::SameLine(0.0f, -1.0f);
+		visible++;
 		avail = ImGui::GetContentRegionAvail();
 		if (avail.x < 128.f)
 			ImGui::NewLine();
@@ -2835,6 +2883,55 @@ static void browserregiontextures(struct ae_terrain_module * mod)
 				ImVec2(0.f, 0.f), ImVec2(1.f, 1.f),
 				ImVec4(1.f, 1.f, 1.f, 1.f),
 				border);
+			{
+				ImVec2 img_min = ImGui::GetItemRectMin();
+				ImVec2 img_max = ImGui::GetItemRectMax();
+				uint32_t layer_count = 0;
+				const char * first_layer = NULL;
+				uint32_t gi;
+				for (gi = 0; gi < mod->tex_group_count; gi++) {
+					struct texture_group * g =
+						&mod->tex_groups[gi];
+					uint32_t tc = vec_count(g->textures);
+					uint32_t ti;
+					for (ti = 0; ti < tc; ti++) {
+						if (g->textures[ti].idx ==
+								tex.idx) {
+							if (!first_layer)
+								first_layer =
+									g->name;
+							layer_count++;
+							break;
+						}
+					}
+				}
+				if (layer_count > 0) {
+					char lbl[TEXTURE_GROUP_NAME_LENGTH + 8];
+					if (layer_count == 1)
+						snprintf(lbl, sizeof(lbl), "%s",
+							first_layer);
+					else
+						snprintf(lbl, sizeof(lbl), "%u",
+							layer_count);
+					ImDrawList * dl =
+						ImGui::GetWindowDrawList();
+					ImVec2 ts = ImGui::CalcTextSize(lbl);
+					float pad = 3.0f;
+					ImVec2 bg_min = ImVec2(
+						img_max.x - ts.x - pad * 2,
+						img_min.y);
+					ImVec2 bg_max = ImVec2(
+						img_max.x,
+						img_min.y + ts.y + pad * 2);
+					dl->AddRectFilled(bg_min, bg_max,
+						IM_COL32(0, 0, 0, 180), 4.0f);
+					dl->AddText(
+						ImVec2(bg_min.x + pad,
+							bg_min.y + pad),
+						IM_COL32(255, 255, 100, 255),
+						lbl);
+				}
+			}
 			if (ImGui::BeginDragDropSource(
 					ImGuiDragDropFlags_SourceAllowNullID)) {
 				ImGui::SetDragDropPayload("TEX_HANDLE", &tex,
@@ -2923,6 +3020,7 @@ static void browserregiontextures(struct ae_terrain_module * mod)
 				mod->highlight_texture = tex;
 		}
 	}
+	}
 	ImGui::End();
 }
 
@@ -2941,6 +3039,82 @@ static void save_layer_definitions(struct ae_terrain_module * mod)
 	json_serialize_to_file_pretty(root,
 		"export/terrain/texture_layers.json");
 	json_value_free(root);
+}
+
+static void save_biome_groups(struct ae_terrain_module * mod)
+{
+	JSON_Value * root = json_value_init_object();
+	JSON_Object * obj = json_value_get_object(root);
+	JSON_Value * groups_val = json_value_init_array();
+	JSON_Array * groups_arr = json_value_get_array(groups_val);
+	uint32_t i;
+	for (i = 0; i < mod->biome_group_count; i++) {
+		struct biome_group * g = &mod->biome_groups[i];
+		JSON_Value * gv = json_value_init_object();
+		JSON_Object * go = json_value_get_object(gv);
+		JSON_Value * rv = json_value_init_array();
+		JSON_Array * ra = json_value_get_array(rv);
+		uint32_t ri;
+		json_object_set_string(go, "name", g->name);
+		for (ri = 0; ri < vec_count(g->region_ids); ri++)
+			json_array_append_number(ra,
+				(double)g->region_ids[ri]);
+		json_object_set_value(go, "regions", rv);
+		json_array_append_value(groups_arr, gv);
+	}
+	json_object_set_value(obj, "groups", groups_val);
+	_mkdir("export");
+	_mkdir("export/terrain");
+	json_serialize_to_file_pretty(root,
+		"export/terrain/biome_groups.json");
+	json_value_free(root);
+}
+
+static void load_biome_groups(struct ae_terrain_module * mod)
+{
+	JSON_Value * root = json_parse_file(
+		"export/terrain/biome_groups.json");
+	JSON_Object * obj;
+	JSON_Array * groups;
+	size_t count;
+	size_t i;
+	if (!root)
+		return;
+	obj = json_value_get_object(root);
+	groups = json_object_get_array(obj, "groups");
+	if (!groups) {
+		json_value_free(root);
+		return;
+	}
+	count = json_array_get_count(groups);
+	for (i = 0; i < count &&
+		mod->biome_group_count < MAX_BIOME_GROUPS; i++) {
+		JSON_Object * go = json_array_get_object(groups, i);
+		const char * name;
+		JSON_Array * regions;
+		struct biome_group * g;
+		size_t rc, ri;
+		if (!go)
+			continue;
+		name = json_object_get_string(go, "name");
+		if (!name)
+			continue;
+		g = &mod->biome_groups[mod->biome_group_count++];
+		strlcpy(g->name, name, sizeof(g->name));
+		g->region_ids = (uint32_t *)vec_new_reserved(
+			sizeof(*g->region_ids), 16);
+		regions = json_object_get_array(go, "regions");
+		if (!regions)
+			continue;
+		rc = json_array_get_count(regions);
+		for (ri = 0; ri < rc; ri++) {
+			uint32_t rid =
+				(uint32_t)json_array_get_number(regions, ri);
+			vec_push_back((void **)&g->region_ids, &rid);
+		}
+	}
+	json_value_free(root);
+	INFO("Loaded %u biome groups.", mod->biome_group_count);
 }
 
 static void save_region_layers(struct ae_terrain_module * mod)
@@ -3273,6 +3447,152 @@ static void render_layer_window(struct ae_terrain_module * mod)
 			}
 		}
 		ImGui::EndTabBar();
+	}
+	ImGui::End();
+}
+
+static void render_biome_window(struct ae_terrain_module * mod)
+{
+	uint32_t gi;
+	ImGui::SetNextWindowSize(ImVec2(400.f, 500.f), ImGuiCond_FirstUseEver);
+	if (!ImGui::Begin("Biome Groups", &mod->show_biome_window)) {
+		ImGui::End();
+		return;
+	}
+	/* Add new biome. */
+	ImGui::InputText("##newbiome", mod->new_biome_name,
+		sizeof(mod->new_biome_name));
+	ImGui::SameLine();
+	if (ImGui::Button("Add Biome") &&
+		mod->new_biome_name[0] != '\0' &&
+		mod->biome_group_count < MAX_BIOME_GROUPS) {
+		struct biome_group * g =
+			&mod->biome_groups[mod->biome_group_count++];
+		strlcpy(g->name, mod->new_biome_name, sizeof(g->name));
+		g->region_ids = (uint32_t *)vec_new_reserved(
+			sizeof(*g->region_ids), 16);
+		mod->new_biome_name[0] = '\0';
+		save_biome_groups(mod);
+	}
+	ImGui::Separator();
+	if (mod->active_region_id != UINT32_MAX) {
+		ImGui::Text("Active Region: %u", mod->active_region_id);
+		ImGui::Separator();
+	}
+	for (gi = 0; gi < mod->biome_group_count; gi++) {
+		struct biome_group * g = &mod->biome_groups[gi];
+		uint32_t rc = vec_count(g->region_ids);
+		uint32_t ri;
+		boolean active_in_biome = FALSE;
+		char header[128];
+		/* Check if active region is in this biome. */
+		if (mod->active_region_id != UINT32_MAX) {
+			for (ri = 0; ri < rc; ri++) {
+				if (g->region_ids[ri] ==
+						mod->active_region_id) {
+					active_in_biome = TRUE;
+					break;
+				}
+			}
+		}
+		snprintf(header, sizeof(header), "%s (%u regions)###biome%u",
+			g->name, rc, gi);
+		if (active_in_biome)
+			ImGui::PushStyleColor(ImGuiCol_Header,
+				ImVec4(0.2f, 0.6f, 0.2f, 0.8f));
+		if (ImGui::CollapsingHeader(header)) {
+			/* Add/remove active region button. */
+			if (mod->active_region_id != UINT32_MAX) {
+				if (active_in_biome) {
+					char btn_id[64];
+					snprintf(btn_id, sizeof(btn_id),
+						"Remove Region %u###rm%u",
+						mod->active_region_id, gi);
+					if (ImGui::Button(btn_id)) {
+						for (ri = 0; ri < rc; ri++) {
+							if (g->region_ids[ri] ==
+								mod->active_region_id) {
+								vec_erase_iterator(
+									g->region_ids, ri);
+								break;
+							}
+						}
+						save_biome_groups(mod);
+					}
+				}
+				else {
+					char btn_id[64];
+					snprintf(btn_id, sizeof(btn_id),
+						"Add Region %u###add%u",
+						mod->active_region_id, gi);
+					if (ImGui::Button(btn_id)) {
+						vec_push_back(
+							(void **)&g->region_ids,
+							&mod->active_region_id);
+						save_biome_groups(mod);
+					}
+				}
+			}
+			/* List regions in this biome. */
+			rc = vec_count(g->region_ids);
+			for (ri = 0; ri < rc; ri++) {
+				uint32_t rid = g->region_ids[ri];
+				struct ap_map_region_template * t =
+					ap_map_get_region_template(
+						mod->ap_map, rid);
+				char label[128];
+				boolean has_terrain = rid <=
+					AP_MAP_MAX_REGION_ID &&
+					mod->region.colors[rid].refcount > 0;
+				if (t && t->glossary[0])
+					snprintf(label, sizeof(label),
+						"[%u] %s", rid, t->glossary);
+				else
+					snprintf(label, sizeof(label),
+						"Region %u", rid);
+				boolean is_active = rid ==
+					mod->active_region_id;
+				if (is_active)
+					ImGui::PushStyleColor(
+						ImGuiCol_Text,
+						ImVec4(0.3f, 1.f, 0.3f, 1.f));
+				else if (!has_terrain)
+					ImGui::PushStyleColor(
+						ImGuiCol_Text,
+						ImVec4(0.5f, 0.5f, 0.5f, 0.5f));
+				ImGui::BulletText("%s", label);
+				if (is_active || !has_terrain)
+					ImGui::PopStyleColor();
+				if (ImGui::IsItemHovered() &&
+					ImGui::IsMouseDoubleClicked(
+						ImGuiMouseButton_Left)) {
+					mod->pending_region_id = rid;
+					mod->region_changed = TRUE;
+					if (t && (t->zone_src[0] != 0.f ||
+							t->zone_src[1] != 0.f)) {
+						struct ac_camera * cam =
+							ac_camera_get_main(
+								mod->ac_camera);
+						vec3 center;
+						center[0] = t->zone_src[0];
+						center[1] = 0.f;
+						center[2] = t->zone_src[1];
+						ac_camera_focus_on(cam,
+							center, 5000.f);
+					}
+				}
+				if (ImGui::IsItemClicked(
+						ImGuiMouseButton_Right)) {
+					vec_erase_iterator(
+						g->region_ids, ri);
+					rc--;
+					ri--;
+					save_biome_groups(mod);
+				}
+			}
+		}
+		if (active_in_biome)
+			ImGui::PopStyleColor();
 	}
 	ImGui::End();
 }
@@ -3776,6 +4096,9 @@ void ae_terrain_toolbar(struct ae_terrain_module * mod)
 			if (ImGui::Button("Layer Groups"))
 				mod->show_layer_window = !mod->show_layer_window;
 			ImGui::SameLine();
+			if (ImGui::Button("Biomes"))
+				mod->show_biome_window = !mod->show_biome_window;
+			ImGui::SameLine();
 			if (ImGui::Button("Export") &&
 				mod->tex_group_count > 0)
 				mod->show_export_confirm = true;
@@ -3811,6 +4134,8 @@ void ae_terrain_toolbar(struct ae_terrain_module * mod)
 			browserregiontextures(mod);
 		if (mod->show_layer_window)
 			render_layer_window(mod);
+		if (mod->show_biome_window)
+			render_biome_window(mod);
 		ImGui::PopStyleVar(1);
 		break;
 	}

@@ -146,7 +146,7 @@ static boolean oninitialize(struct ac_render_module * mod)
 	mod->wnd = SDL_CreateWindow("ArchLord Editor",
 		SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
 		mod->width, mod->height,
-		SDL_WINDOW_RESIZABLE | SDL_WINDOW_FULLSCREEN_DESKTOP);
+		SDL_WINDOW_RESIZABLE);
 	if (!mod->wnd) {
 		ERROR("Failed to create window.");
 		return FALSE;
